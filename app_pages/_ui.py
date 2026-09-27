@@ -7,7 +7,7 @@ import streamlit as st
 
 from app_pages import _state
 from core import model
-from core.session import auth_configured
+from core.session import auth_configured, connection_source
 from core.schema import APPEND_TABLES
 
 DOCUMENT_PAGE = "app_pages/document.py"
@@ -25,7 +25,8 @@ SAVE_COPY = (
 def sidebar() -> None:
     counts = _state.pending_counts()
     with st.sidebar:
-        st.caption(f"Signed in as **{_state.user()}**")
+        st.caption(f"Signed in as **{_state.user()}**"
+                   + ("  \nSnowflake: your own credentials" if connection_source() == "own" else ""))
         if auth_configured():
             st.button("Log out", on_click=st.logout)
         total = sum(counts.values())

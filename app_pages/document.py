@@ -173,7 +173,8 @@ with tab_files:
             fk = f"{k}:file:{f['file_id']}"
             if c2.button("Download", key=f"{fk}:prep"):
                 try:
-                    data = files.file_bytes(f["stage_path"])
+                    data = files.file_bytes(
+                        f["stage_path"], _state.tokens()["document_file_log"].split("|")[0])
                     c2.download_button("Save file", data, file_name=f["filename"],
                                        mime=f["mimetype"], key=f"{fk}:dl")
                 except Exception as exc:

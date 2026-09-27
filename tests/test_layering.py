@@ -31,3 +31,11 @@ def test_only_state_module_touches_session_state():
         if path.name == "_state.py":
             continue
         assert "session_state" not in path.read_text(), path
+
+
+def test_core_session_state_only_in_session_module():
+    """core/session.py keeps the viewer's own connection (not data) in
+    st.session_state; no other core module may touch it."""
+    for path in (ROOT / "core").glob("*.py"):
+        if path.name != "session.py":
+            assert "session_state" not in path.read_text(), path

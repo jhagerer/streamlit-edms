@@ -29,16 +29,25 @@ def _probe_one(session, table: str) -> str:
         return f"{row[0]}:{row[1]}"
 
 
+_SCOPE_SQL = "CURRENT_ACCOUNT(), CURRENT_ROLE(), CURRENT_DATABASE(), CURRENT_SCHEMA()"
+
+
 def change_tokens() -> dict[str, str]:
     """One round trip, all tokens. Deliberately NOT cached: the UI is always
-    consistent with the database as of this rerun."""
+    consistent with the database as of this rerun.
+
+    Each token starts with the connection scope (account/role/database/schema),
+    so viewers on different connections never share a cached frame."""
     session = get_session()
     cols = ", ".join(f"SYSTEM$LAST_CHANGE_COMMIT_TIME('{t}')" for t in APPEND_TABLES)
     try:
-        row = session.sql(f"SELECT {cols}").collect()[0]
-        return {t: str(row[i]) for i, t in enumerate(APPEND_TABLES)}
+        row = session.sql(f"SELECT {_SCOPE_SQL}, {cols}").collect()[0]
+        scope = "/".join(str(v) for v in row[:4])
+        return {t: f"{scope}|{row[4 + i]}" for i, t in enumerate(APPEND_TABLES)}
     except Exception:
-        return {t: _probe_one(session, t) for t in APPEND_TABLES}
+        row = session.sql(f"SELECT {_SCOPE_SQL}").collect()[0]
+        scope = "/".join(str(v) for v in row[:4])
+        return {t: f"{scope}|{_probe_one(session, t)}" for t in APPEND_TABLES}
 
 
 def time_probe(n: int = 20) -> float:

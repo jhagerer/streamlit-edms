@@ -21,6 +21,7 @@ _RESTORED = "_restored"
 _REPORT = "_restore_report"
 _DIRTY = "_dirty"
 _FLASH = "_flash"
+_SCOPE = "_scope"
 
 
 # ── Per-rerun setup ──────────────────────────────────────────────────────────
@@ -30,8 +31,21 @@ def begin_run() -> None:
     """Called at the top of every rerun by streamlit_app.py: one token probe,
     then restore-on-entry the first time."""
     st.session_state[_TOKENS] = read.change_tokens()
+    scope = current_scope()
+    if st.session_state.get(_SCOPE) not in (None, scope):
+        # The connection now points at another account/role/db/schema. Pending
+        # rows belong to the old one: never flush them here. Start over and
+        # restore this connection's own snapshot instead.
+        _store().clear()
+        st.session_state[_RESTORED] = False
+    st.session_state[_SCOPE] = scope
     if not st.session_state.get(_RESTORED):
         _restore_on_entry()
+
+
+def current_scope() -> str:
+    """account/role/database/schema of the current connection (from the tokens)."""
+    return next(iter(tokens().values())).split("|", 1)[0]
 
 
 def tokens() -> dict[str, str]:
@@ -215,3 +229,16 @@ def try_begin_run() -> str | None:
         return None
     except Exception as exc:
         return str(exc)
+
+
+# ── Key pair generated on the Setup page (this browser session only) ─────────
+
+_GENERATED_KEY = "_generated_key"
+
+
+def set_generated_key(private_pem: str, public_pem: str, passphrase: str) -> None:
+    st.session_state[_GENERATED_KEY] = (private_pem, public_pem, passphrase)
+
+
+def generated_key() -> tuple[str, str, str] | None:
+    return st.session_state.get(_GENERATED_KEY)

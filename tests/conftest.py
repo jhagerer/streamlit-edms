@@ -74,6 +74,8 @@ class FakeSession:
         self.file = _Files(self)
         self.queries: list[str] = []
         self.schema_missing = False  # simulate a fresh schema without MiniDMS objects
+        self.offline = False  # simulate "no connection configured"
+        self.closed = False
         self.executed: list[str] = []
 
     def create_dataframe(self, rows, schema=None):
@@ -87,7 +89,12 @@ class FakeSession:
         return pa.table({k: pa.array(v, type=pa_schema.get(k.lower(), pa.string()))
                          for k, v in data.items()})
 
+    def close(self):
+        self.closed = True
+
     def sql(self, query, params=None):
+        if self.offline:
+            raise RuntimeError("Missing Snowflake connection configuration")
         self.queries.append(query)
         q = query.strip()
         if q.startswith(("CREATE", "GRANT", "USE")):
@@ -114,8 +121,12 @@ class FakeSession:
             for k in [k for k in self.stage if k.startswith(prefix)]:
                 del self.stage[k]
             return _Result([])
+        scope = (("ACCT", "ROLE", "DB", "SCHEMA")
+                 if "CURRENT_ACCOUNT()" in q and "CURRENT_USER()" not in q else ())
         if "SYSTEM$LAST_CHANGE_COMMIT_TIME" in q:
-            return _Result([tuple(self.commits.get(t, 0) for t in re.findall(r"'(\w+)'", q))])
+            return _Result([scope + tuple(self.commits.get(t, 0) for t in re.findall(r"'(\w+)'", q))])
+        if scope and "FROM" not in q:
+            return _Result([scope])
         m = re.fullmatch(r"SELECT \* FROM (\w+)", q)
         if m:
             return _Result(arrow=self._arrow(m.group(1)))
@@ -131,11 +142,13 @@ class FakeSession:
 
 @pytest.fixture
 def fake(monkeypatch):
-    from core import files, read, search, session, setup, snapshot, write
+    """Route the real get_session() to an in-memory fake: the fake stands in
+    for the app's shared connection, so the per-browser-session connection
+    logic in core/session.py is exercised as well."""
+    from core import read, session
 
     s = FakeSession()
-    for mod in (read, snapshot, write, files, search, session, setup):
-        monkeypatch.setattr(mod, "get_session", lambda: s)
+    monkeypatch.setattr(session, "_local_session", lambda: s)
     monkeypatch.setenv("MINIDMS_USER", "alice")
     monkeypatch.setattr(session, "_mode", "local")
     read.load_log.clear()

@@ -58,10 +58,11 @@ error = _state.try_begin_run()  # one token probe per rerun + restore on entry
 if error:
     st.error(f"Cannot reach the MiniDMS schema in Snowflake: {error}")
     st.info(
-        "Check your Snowflake connection (see README) and that the MiniDMS objects "
-        "exist in the current database/schema."
+        "Either the app has no Snowflake connection yet, or the MiniDMS objects do not "
+        "exist in the current database/schema. The Setup page lets you enter credentials "
+        "(outside Streamlit in Snowflake) and create the objects step by step."
     )
-    st.page_link(setup_page, label="Open the Setup page to create them step by step", icon="⚙️")
+    st.page_link(setup_page, label="Open the Setup page", icon="⚙️")
     st.stop()
 
 _ui.sidebar()

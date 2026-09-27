@@ -192,6 +192,7 @@ def remove_files(relative_paths: list[str], session=None) -> int:
 
 
 @cache_data(max_entries=16, ttl=600)
-def file_bytes(stage_path: str) -> bytes:
-    """Cached download. Staged files are immutable, so caching is safe."""
+def file_bytes(stage_path: str, scope: str) -> bytes:
+    """Cached download. Staged files are immutable, so caching is safe;
+    ``scope`` (from the change token) keeps connections apart."""
     return get_bytes(stage_path)

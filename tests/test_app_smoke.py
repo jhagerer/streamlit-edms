@@ -151,3 +151,65 @@ def test_login_required_when_auth_is_configured(fake):
     assert not at.exception, at.exception
     assert [b.label for b in at.button] == ["Log in"]
     assert not fake.queries  # nothing touches Snowflake before login
+
+
+def test_enter_own_credentials_when_not_connected(fake, monkeypatch):
+    """No shared connection: the app points to Setup, the viewer enters a token,
+    and from then on this browser session uses its own connection."""
+    from conftest import FakeSession
+    from core import session as core_session
+
+    fake.offline = True
+    own = FakeSession()
+    opened = {}
+
+    def fake_open(settings):
+        opened["settings"] = settings
+        return own, "BOB"
+
+    monkeypatch.setattr(core_session, "open_session", fake_open)
+    monkeypatch.delenv("MINIDMS_USER")
+
+    at = app().run()
+    assert "Cannot reach the MiniDMS schema" in at.error[0].value
+    at.switch_page("app_pages/setup.py").run()
+    assert not at.exception, at.exception
+    assert any("Not connected" in w.value for w in at.warning)
+
+    at.radio(key="conn:auth").set_value("pat").run()
+    labels = {t.label: t for t in at.text_input}
+    labels["Account"].input("org-acct")
+    labels["User"].input("bob")
+    labels["Programmatic access token"].input("tok")
+    labels["Schema"].input("MINIDMS")
+    click(at.button, "Connect for this browser session")
+    at.run()
+    assert not at.exception, at.exception
+    assert opened["settings"].token == "tok" and opened["settings"].schema == "MINIDMS"
+    assert any("Connected as BOB" in s.value for s in at.success)
+
+    # The rest of the app now runs on the viewer's own connection.
+    at.switch_page("app_pages/documents.py").run()
+    assert not at.exception, at.exception
+    assert at.title[0].value == "Documents"
+    assert "BOB" in at.sidebar.caption[0].value
+    assert own.queries and not fake.queries
+
+    at.switch_page("app_pages/setup.py").run()
+    click(at.button, "Disconnect")
+    at.run()
+    assert own.closed
+    at.switch_page("app_pages/documents.py").run()
+    assert "Cannot reach the MiniDMS schema" in at.error[0].value
+
+
+def test_connection_change_blocked_with_pending_changes(fake):
+    at = app().run()
+    at.switch_page("app_pages/tags.py").run()
+    at.text_input[0].input("Urgent")
+    click(at.button, "Add")
+    at.run()
+    at.switch_page("app_pages/setup.py").run()
+    assert not at.exception, at.exception
+    assert any("before you change the connection" in w.value for w in at.warning)
+    assert not [b for b in at.button if b.label == "Connect for this browser session"]

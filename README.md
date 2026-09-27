@@ -28,19 +28,23 @@ Schema: [`sql/minidms-setup.sql`](sql/minidms-setup.sql)
 ```
 streamlit_app.py        entry point (st.navigation, one token probe per rerun, restore on entry)
 app_pages/              Streamlit pages
-  _state.py             tier-1 appends store — the only module touching st.session_state
+  _state.py             tier-1 appends store — the only page module touching st.session_state
   _ui.py                sidebar, dialogs, document list, metadata widgets
   documents.py upload.py search.py trash.py document.py
   document_types.py metadata_types.py tags.py audit.py admin.py diagnostics.py
   setup.py              runs the setup SQL step by step from inside the app
+  _connection.py        Setup step 1: enter/change Snowflake credentials, key pairs
 core/                   plain Python (no Streamlit, except core/session.py)
-  session.py            Snowpark session (SiS or local), viewer identity, cache decorator
+  session.py            Snowpark session (SiS, own credentials, or secrets), viewer
+                        identity, cache decorator; keeps a viewer's own connection
+                        (never data) in st.session_state
   schema.py             table columns, dtypes, reduction keys, READ_/APPEND_TABLES
   read.py               change tokens, cached loaders, latest(), view(), restore()
   snapshot.py           parquet snapshots on @sessions
   write.py              row builders, validation, save_to_session(), flush()
   files.py              @doc_files upload, AI_PARSE_DOCUMENT, orphan housekeeping
   setup.py              setup script parsing, grants, schema status checks
+  connection.py         connection settings → connector params, secrets.toml, key pairs
   search.py             SEARCH() / ILIKE over document_text
   model.py              current state: documents, tags, metadata, filters
 sql/                    setup DDL, grants and deployment
@@ -57,8 +61,24 @@ Two ways — both run the same idempotent statements (nothing is ever dropped):
 **A. From the app: System → Setup.** The page works before any MiniDMS object exists
 (when the schema is missing, every other page links to it). It walks through:
 
-1. **Connection** — account, user, role, warehouse, database, schema. On a local run you
-   can switch (or create) database and schema here.
+1. **Connection** — shows account, user, role, warehouse, database, schema and where
+   the connection comes from. Outside Streamlit in Snowflake you can also:
+   - **enter or change credentials**: account, user, role, warehouse, database, schema,
+     and one of *key pair* (upload/paste a `.p8`, optional passphrase), *programmatic
+     access token*, *password + MFA passcode*, or *browser SSO* (own computer only).
+     *Test connection* checks them; *Connect for this browser session* uses them for you
+     only — kept in server memory, never written to disk, gone when the tab closes.
+     Leave a secret field empty to keep the one you entered before;
+   - **generate a key pair**: download the private key, get the
+     `ALTER USER … SET RSA_PUBLIC_KEY` statement, optionally run it right away;
+   - **save the connection permanently**: the page renders the `secrets.toml` section to
+     paste into Community Cloud (*Settings → Secrets*) or save locally;
+   - **switch database/schema/warehouse**, optionally creating them;
+   - **disconnect** or **reconnect** the shared connection after changing secrets.
+
+   In Streamlit in Snowflake there is nothing to enter — Snowflake provides the session.
+   While you have unsaved changes the connection cannot be changed (they belong to the
+   current account and schema).
 2. **Stages** — `@doc_files`, `@sessions`
 3. **Tables** — the eight event logs
 4. **Audit view** — `audit_v`
@@ -72,9 +92,11 @@ Every statement is shown before it runs; each has its own *Run* button, and ever
 has *Run all*. A progress bar shows how many of the 11 objects exist; a log shows
 each result.
 
-Who may run it: on a local run, you. In Streamlit in Snowflake, only the app owner. On a
-shared deployment with login (e.g. Community Cloud), only the users listed in
-`MINIDMS_SETUP_USERS`. Everyone else sees the page read-only.
+Who may run the setup statements: on a local run, you; with credentials you entered
+yourself, you (Snowflake's privileges decide what succeeds). In Streamlit in Snowflake,
+only the app owner. On a shared deployment with login (e.g. Community Cloud) using the
+shared connection, only the users listed in `MINIDMS_SETUP_USERS`. Everyone else sees
+the statements read-only — but can always connect with their own credentials.
 
 **B. In a worksheet.** Run [`sql/minidms-setup.sql`](sql/minidms-setup.sql), then adapt
 [`sql/minidms-grants-and-deploy.sql`](sql/minidms-grants-and-deploy.sql).
@@ -133,19 +155,24 @@ Locally, the person at the screen is the person whose credentials are used, so
 ## 2c. Run on Streamlit Community Cloud
 
 The same code runs on [Streamlit Community Cloud](https://share.streamlit.io). It
-connects to Snowflake over the internet like the local version. Two things differ from a
-local run:
+connects to Snowflake over the internet, like the local version.
 
-- **No browser SSO.** The app needs a Snowflake user that can log in without a person:
-  a *service user with key-pair authentication*.
-- **One Snowflake user for everybody.** So `CURRENT_USER()` cannot tell viewers apart.
-  Turn on Streamlit's login (`[auth]` in the secrets). The app then records the viewer's
-  login e-mail as the actor and gives each viewer their own `@sessions` folder. When
-  `[auth]` is configured, the app asks for a login before it touches Snowflake.
+**Deploy:** on [share.streamlit.io](https://share.streamlit.io) → *Create app* → pick the
+GitHub repository and branch, main file `streamlit_app.py`; under *Advanced settings*
+choose Python 3.11. Then choose how the app gets its Snowflake credentials:
 
-Steps:
+**Option A — enter them in the app (quickest).** Deploy without secrets. Open the app →
+it links to **Setup** → step 1: enter account, user, role, warehouse, database, schema
+and a key pair / token / password → *Connect for this browser session*. Then run the
+setup steps. Each viewer connects with their own Snowflake user, so the actor is right
+automatically. Credentials live only in memory for that browser tab; after a reload you
+enter them again.
 
-1. **Service user** (in Snowflake, as an admin). Create a key pair:
+**Option B — a shared service user in the secrets (for a team).** Everybody uses one
+connection; nobody has to enter credentials.
+
+1. **Service user with a key pair.** Generate the key pair on the Setup page (step 1 →
+   *Generate a key pair*, e.g. from a local run or with Option A), or with openssl:
    ```bash
    openssl genrsa 2048 | openssl pkcs8 -topk8 -inform PEM -out rsa_key.p8 -nocrypt
    openssl rsa -in rsa_key.p8 -pubout -out rsa_key.pub
@@ -154,27 +181,33 @@ Steps:
    CREATE ROLE IF NOT EXISTS MINIDMS_APP;
    CREATE USER IF NOT EXISTS MINIDMS_SVC TYPE = SERVICE
      DEFAULT_ROLE = MINIDMS_APP DEFAULT_WAREHOUSE = <wh>
-     RSA_PUBLIC_KEY = '<contents of rsa_key.pub without the BEGIN/END lines>';
+     RSA_PUBLIC_KEY = '<public key without the BEGIN/END lines>';
    GRANT ROLE MINIDMS_APP TO USER MINIDMS_SVC;
    ```
-   Then create the schema objects (worksheet, or the Setup page from a local run) and
-   grant `MINIDMS_APP` its privileges (Setup step 5). If your account uses a network
-   policy, it must allow connections from Community Cloud.
-2. **Login provider.** Create an OpenID Connect client, e.g. in the Google Cloud Console
-   (OAuth client ID, type *Web application*), with the redirect URI
-   `https://<your-app>.streamlit.app/oauth2callback`.
-3. **Deploy.** On [share.streamlit.io](https://share.streamlit.io) → *Create app* → pick
-   the GitHub repository and branch, main file `streamlit_app.py`. Under *Advanced
-   settings* choose Python 3.11 and paste the secrets — template in
+   Create the objects and grant `MINIDMS_APP` its privileges (Setup steps 2–5).
+2. **Secrets.** Paste into *⋮ → Settings → Secrets*. Template:
    [`.streamlit/secrets.community-cloud.toml.example`](.streamlit/secrets.community-cloud.toml.example).
-   The private key can be pasted as PEM; the app converts it.
-4. **Check.** Log in, open **Diagnostics**: *Viewer (actor)* must be your e-mail, and
+   The Setup page can also generate the `[connections.snowflake]` section for you
+   (step 1 → *Save the connection permanently*). The private key can stay in PEM form;
+   the app converts it.
+3. **Login.** With one Snowflake user for everybody, `CURRENT_USER()` cannot tell viewers
+   apart. Add Streamlit's login (`[auth]` in the secrets, e.g. Google as OpenID Connect
+   provider with the redirect URI `https://<your-app>.streamlit.app/oauth2callback`).
+   The app then records the viewer's login e-mail as the actor, gives each viewer their
+   own `@sessions` folder, and asks for login before it touches Snowflake. List the
+   people who may run Setup in `MINIDMS_SETUP_USERS`.
+4. **Check.** Log in, open **Diagnostics**: *Viewer (actor)* must be your e-mail and
    `CURRENT_USER()` the service user. Open **Setup**: the progress bar must be full.
 
-Notes: queries, Cortex text extraction and storage are billed to your Snowflake
-account. The cache is shared by all viewers of the app. Community Cloud gives an app
-limited memory, which caps how large the logs can grow before you need the reduced
-view (§9.10).
+Both options can be combined: with secrets configured, a viewer can still connect with
+their own credentials on the Setup page (and disconnect again).
+
+Notes: if your Snowflake account has a network policy, it must allow connections from
+Community Cloud. Queries, Cortex text extraction and storage are billed to your Snowflake
+account. Cached data is keyed by account, role, database and schema, so viewers on
+different connections never see each other's cached data; viewers on the same one share
+it. Community Cloud gives an app limited memory, which caps how large the logs can grow
+before you need the reduced view (§9.10).
 
 ## Tests
 

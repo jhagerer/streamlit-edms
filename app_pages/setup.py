@@ -6,9 +6,9 @@ all schema statements are idempotent (IF NOT EXISTS / OR REPLACE on the view).
 
 import streamlit as st
 
-from app_pages import _state
+from app_pages import _connection, _state
 from core import setup, write
-from core.session import auth_configured, in_sis, setup_allowed
+from core.session import auth_configured, connection_source, in_sis, setup_allowed
 
 st.title("Setup")
 st.caption("Create the MiniDMS objects in Snowflake step by step. Each statement is shown "
@@ -16,17 +16,14 @@ st.caption("Create the MiniDMS objects in Snowflake step by step. Each statement
 
 # ── Step 1: connection ───────────────────────────────────────────────────────
 
-try:
-    ctx = setup.context()
-except Exception as exc:
-    st.error(f"No Snowflake connection: {exc}")
-    st.info("Configure the connection first — see the README (local: "
-            "`.streamlit/secrets.toml`; Community Cloud: the app's *Secrets* settings).")
+ctx = _connection.connection_step()
+if ctx is None:
     st.stop()
 
 allowed, why = setup_allowed()
 if not allowed:
-    st.warning(f"You can view the setup but not run it: {why}.", icon="🔒")
+    st.warning(f"You can view the setup but not run it: {why}. You can still connect "
+               "with your own credentials above.", icon="🔒")
 
 
 def run_statement(sql: str) -> bool:
@@ -46,19 +43,19 @@ def run_all(statements, label: str) -> None:
     st.rerun()
 
 
-st.header("1 · Connection")
-c = st.columns(6)
-for col, key in zip(c, ("account", "user", "role", "warehouse", "database", "schema")):
-    col.metric(key.capitalize(), ctx[key] or "—")
-
-can_switch = allowed and not in_sis() and not auth_configured()
-if in_sis():
-    st.caption("In Streamlit in Snowflake the app uses its own database and schema. "
-               "The objects must be created there.")
-elif can_switch:
+# Switching db/schema changes the session. Only offer it where that session
+# belongs to this viewer alone, or on a plain single-user local run.
+can_switch = allowed and not in_sis() and (
+    connection_source() == "own" or not auth_configured()
+)
+if can_switch:
     with st.expander("Use another database / schema / warehouse", expanded=not ctx["schema"]):
-        st.caption("Applies to this app process (the connection is shared). To make it "
-                   "permanent, set database/schema/warehouse in your connection settings.")
+        if connection_source() == "own":
+            st.caption("Applies to your own connection for this browser session.")
+        else:
+            st.caption("Applies to the shared connection of this app process until it "
+                       "restarts. To make it permanent, set database/schema/warehouse in "
+                       "the connection settings.")
         c1, c2, c3 = st.columns(3)
         db = c1.text_input("Database", value=ctx["database"] or "")
         sch = c2.text_input("Schema", value=ctx["schema"] or "MINIDMS")
