@@ -60,3 +60,30 @@ def test_definitions_hide_inactive():
                          stamp(write.tag_row(u, "t", "Old", "#000", active=False), 1)])
     assert model.definitions(log, "tag_log").height == 0
     assert model.definitions(log, "tag_log", include_inactive=True).height == 1
+
+
+def test_file_text_status():
+    u = "alice"
+    f_rows = [write.file_row(u, document_id="d", file_id=fid, filename=f"{fid}.pdf", stage_path="p",
+                             mimetype=None, size=1, checksum=None, page_count=None)
+              for fid in ("new", "wait", "q", "ok", "bad", "retried")]
+    for r in f_rows:
+        r["event_ts"] = T + timedelta(seconds=10)
+    committed = write.rows_frame("document_file_log", f_rows[1:])
+    pending = write.rows_frame("document_file_log", [f_rows[0]])
+    files = model.current_files(read.compose(committed, pending))
+    # "retried": failed at t=5, resubmitted (file row) at t=10 -> waiting again
+    ocr = pl.DataFrame(
+        [("q", "queued", 11, None), ("ok", "done", 12, 3), ("bad", "failed", 12, None),
+         ("retried", "failed", 5, None)],
+        schema={"file_id": pl.Utf8, "status": pl.Utf8, "s": pl.Int64, "page_count": pl.Int64},
+        orient="row",
+    ).with_columns(
+        (pl.lit(T) + pl.duration(seconds=pl.col("s"))).cast(pl.Datetime("us")).alias("event_ts"),
+        pl.lit("boom").alias("message"),
+    )
+    out = model.file_text_status(files, ocr)
+    got = dict(zip(out["file_id"], out["text_status"]))
+    assert got == {"new": "unsaved", "wait": "waiting", "q": "queued", "ok": "done",
+                   "bad": "failed", "retried": "waiting"}
+    assert out.filter(pl.col("file_id") == "ok")["ocr_pages"][0] == 3

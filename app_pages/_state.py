@@ -139,9 +139,14 @@ def view(table: str) -> pl.DataFrame:
     return read.view(table, appends(table), tokens())
 
 
-def pending_text_file_ids() -> set[str]:
-    df = appends("document_text")
-    return set(df["file_id"].to_list()) if df.height else set()
+def ocr_status() -> pl.DataFrame:
+    """Latest text-extraction status per file (written by the Snowflake task).
+    Empty while the pipeline is not set up yet (e.g. ocr_status_v missing), so
+    the pages keep working; the files then show as 'waiting'."""
+    try:
+        return read.load_ocr_status(tokens()["ocr_log"])
+    except Exception:
+        return schema.empty("ocr_log")
 
 
 # ── Writing ──────────────────────────────────────────────────────────────────

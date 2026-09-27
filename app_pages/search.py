@@ -1,7 +1,7 @@
 import polars as pl
 import streamlit as st
 
-from app_pages import _state, _ui
+from app_pages import _ui
 from core import model, search
 
 st.title("Search")
@@ -26,9 +26,10 @@ if query.strip():
 shown = model.filter_documents(docs, "", f["document_type_ids"], f["tag_ids"], ids=ids)
 _ui.document_list(shown, "search", empty_text="No matching documents.")
 
-pending_text = _state.pending_text_file_ids()
-if pending_text:
-    files = model.current_files(_state.view("document_file_log"))
-    n = files.filter(pl.col("file_id").is_in(list(pending_text)))["document_id"].n_unique()
-    st.info(f"{n} document(s) have text that is not yet saved to the database — "
-            "not yet saved, not yet searchable.", icon="ℹ️")
+not_yet = _ui.file_status().filter(
+    pl.col("text_status").is_in(["unsaved", "waiting", "queued"])
+)
+if not_yet.height:
+    n = not_yet["document_id"].n_unique()
+    st.info(f"{n} document(s) are not searchable yet: their text is extracted in Snowflake "
+            "after they are saved to the database.", icon="ℹ️")

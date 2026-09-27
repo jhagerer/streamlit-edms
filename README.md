@@ -42,7 +42,8 @@ core/                   plain Python (no Streamlit, except core/session.py)
   read.py               change tokens, cached loaders, latest(), view(), restore()
   snapshot.py           parquet snapshots on @sessions
   write.py              row builders, validation, save_to_session(), flush()
-  files.py              @doc_files upload, AI_PARSE_DOCUMENT, orphan housekeeping
+  files.py              @doc_files upload ({checksum}/{filename}), orphan housekeeping
+  ocr.py                extraction task state, recent runs, run on demand
   setup.py              setup script parsing, grants, schema status checks
   connection.py         connection settings → connector params, secrets.toml, key pairs
   search.py             SEARCH() / ILIKE over document_text
@@ -80,16 +81,21 @@ Two ways — both run the same idempotent statements (nothing is ever dropped):
    While you have unsaved changes the connection cannot be changed (they belong to the
    current account and schema).
 2. **Stages** — `@doc_files`, `@sessions`
-3. **Tables** — the eight event logs
-4. **Audit view** — `audit_v`
-5. **Grants** (optional) — `SELECT, INSERT` (no `UPDATE`/`DELETE`) for an app role
-6. **PyPI integration** (optional, SiS container runtime; usually ACCOUNTADMIN)
-7. **`CREATE STREAMLIT`** (shown for copying only)
-8. **Starter definitions** (optional) — a few document types, metadata types and tags,
+3. **Tables** — the seven event logs the app writes, plus `document_text` and `ocr_log`
+   (written only by the extraction task)
+4. **Views** — `audit_v`, `ocr_status_v`
+5. **Text extraction** — stream `document_file_log_stream`, procedure `extract_text()`,
+   triggered task `extract_text_task`, and `ALTER TASK … RESUME`
+6. **Grants** (optional) — `SELECT, INSERT` (no `UPDATE`/`DELETE`) for an app role;
+   `SELECT` only on `document_text`/`ocr_log`; `MONITOR, OPERATE` on the task
+7. **PyPI integration** (optional, SiS container runtime; usually ACCOUNTADMIN)
+8. **`CREATE STREAMLIT`** (shown for copying only)
+9. **Starter definitions** (optional) — a few document types, metadata types and tags,
    added as pending changes you then *Save to database*
 
 Every statement is shown before it runs; each has its own *Run* button, and every step
-has *Run all*. A progress bar shows how many of the 11 objects exist; a log shows
+has *Run all*. A progress bar shows how many of the 17 objects exist (including whether the task is
+started); a log shows
 each result.
 
 Who may run the setup statements: on a local run, you; with credentials you entered
@@ -145,7 +151,6 @@ Optional environment variables:
 | `MINIDMS_CONNECTION` | Name of the Streamlit connection to use (default `snowflake`) |
 | `MINIDMS_DATABASE`, `MINIDMS_SCHEMA`, `MINIDMS_WAREHOUSE` | Override the connection's defaults |
 | `MINIDMS_USER` | Actor name to record (default: `CURRENT_USER()` of your connection) |
-| `MINIDMS_PARSE_MODE` | `OCR` (default) or `LAYOUT` for `AI_PARSE_DOCUMENT` |
 | `MINIDMS_RUNTIME` | Force `local` or `sis` if auto-detection gets it wrong |
 | `MINIDMS_SETUP_USERS` | Comma-separated users allowed to run the Setup page (env or secrets) |
 
@@ -229,10 +234,26 @@ session.
 - **Upload** — choose files, a document type, tags and metadata. Each file becomes one
   document. *Files upload immediately; entries are saved when you click
   **Save to database**.*
-- Text is extracted during upload with `AI_PARSE_DOCUMENT` (PDF, DOCX, PPTX, images,
-  HTML, TXT). Plain-text formats (`.txt`, `.md`, `.csv`, …) are read directly. If
-  extraction fails, the document is not created — unless you tick *Keep documents whose
-  text extraction fails*; then you can retry on the document's **Text** tab.
+- **Files** go to `@doc_files/{sha256}/{filename}` at upload time (the name is made
+  path-safe; the original name stays in `document_file_log.filename`). Same content under
+  the same name is stored once. The `document_file_log` row that points to the file waits
+  in your session like every other change.
+- **Text (OCR) is extracted in Snowflake, after Save to database.** The new
+  `document_file_log` rows appear in the stream `document_file_log_stream`; that fires
+  the triggered task `extract_text_task`, which calls `extract_text()`:
+  1. it consumes the stream and queues each new active file without text (`ocr_log`
+     status `queued`);
+  2. for each queued file it reuses the text of an identical file (same checksum) or
+     calls `AI_PARSE_DOCUMENT(TO_FILE('@doc_files', path), {'mode': 'OCR'})`, then
+     appends to `document_text` and `ocr_log` (`done` with page count, `failed` with the
+     error, or `skipped` for file types Cortex does not read: supported are PDF, DOCX,
+     PPTX, JPEG/PNG/TIFF, HTML, TXT).
+
+  The app never calls Cortex. The document's **Text** tab shows the status (*not saved
+  yet*, *waiting*, *queued*, *done*, *failed*, *skipped*); for *failed* or *waiting*
+  files, *Request text extraction again* appends a fresh file row, which goes through
+  the same stream after saving. **Admin → Text extraction** shows the task state,
+  counts, failures and recent runs, and can start a run on demand.
 - **Documents / Search / Trash** — filter in memory by type, tags and text. **Search**
   asks Snowflake for full-text matches (`SEARCH()` or substring).
 - **Document** — properties, metadata, tags, files (download, add, remove), extracted
@@ -267,7 +288,10 @@ tables for everyone.
   later *Save to session* wins.
 - Unsaved work is only safe after *Save to session*.
 - Uploaded bytes stay in `@doc_files` even if you discard — clean them up on **Admin**.
-- Text that is not yet saved to the database is not searchable yet.
+- A document is searchable only after it is saved *and* the task has extracted its text
+  (usually well under a minute; the Search page says how many are still waiting).
+- Files of other types (e.g. `.md`, `.csv`, `.xlsx`) are stored and downloadable but get
+  no text (`skipped`).
 - No page viewer — use the extracted text and the download button.
 - The schema has no link between document types and metadata types, so all active
   metadata types are offered for every document.
@@ -284,6 +308,10 @@ These could not be verified without a Snowflake account. Please check them once:
    `COUNT(*)`/`MAX(event_ts)` if it does not).
 3. `REMOVE @sessions/<user>/` only removes that folder.
 4. `pl.read_parquet` reads what `session.file.get_stream()` returns.
-5. `AI_PARSE_DOCUMENT(TO_FILE('@doc_files', ?), {'mode': 'OCR'})` works with a bound path.
+5. `extract_text()` compiles and works: `CALL extract_text();` after saving one PDF, then
+   `SELECT * FROM ocr_status_v;` (it binds the path into
+   `AI_PARSE_DOCUMENT(TO_FILE('@doc_files', :v_rel), {'mode': 'OCR'})`).
 6. `@st.cache_data` is shared across viewers on the compute pool (check `QUERY_HISTORY`
    after opening the app as two users).
+7. The triggered task fires by itself: save a document, then check
+   `TABLE(INFORMATION_SCHEMA.TASK_HISTORY(TASK_NAME => 'EXTRACT_TEXT_TASK'))`.

@@ -20,9 +20,17 @@ READ_TABLES: tuple[str, ...] = (
     "tag_log",
 )
 
-# Appended to, persisted to parquet, flushed. Superset of READ_TABLES.
-# document_text is NEVER bulk-loaded; it only gets an id-only loader.
-APPEND_TABLES: tuple[str, ...] = READ_TABLES + ("document_text",)
+# Appended to by the app, persisted to parquet, flushed. Same as READ_TABLES.
+APPEND_TABLES: tuple[str, ...] = READ_TABLES
+
+# Written only inside Snowflake by extract_text() (stream + triggered task).
+# document_text is NEVER bulk-loaded; ocr_log is read through ocr_status_v.
+SYSTEM_TABLES: tuple[str, ...] = ("document_text", "ocr_log")
+
+# Everything the app probes for change tokens.
+TOKEN_TABLES: tuple[str, ...] = APPEND_TABLES + SYSTEM_TABLES
+
+OCR_STATUSES = ("queued", "done", "failed", "skipped")
 
 TS = pl.Datetime("us")
 S = pl.Utf8
@@ -93,6 +101,14 @@ COLUMNS: dict[str, dict[str, pl.DataType]] = {
         "file_id": S,
         "content": S,
     },
+    "ocr_log": {
+        **_EVENT,
+        "file_id": S,
+        "stage_path": S,
+        "status": S,
+        "page_count": I,
+        "message": S,
+    },
 }
 
 # Reduction keys: current state = latest row per key by (event_ts, event_id).
@@ -105,6 +121,7 @@ KEYS: dict[str, list[str]] = {
     "metadata_type_log": ["metadata_type_id"],
     "tag_log": ["tag_id"],
     "document_text": ["file_id"],
+    "ocr_log": ["file_id"],
 }
 
 DOCUMENT_OPS = ("create", "update", "trash", "restore")

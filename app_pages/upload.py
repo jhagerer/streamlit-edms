@@ -35,10 +35,6 @@ with st.form("upload", clear_on_submit=True):
         for i, (mt_id, mt) in enumerate(mt_by_id.items()):
             with cols[i % 2]:
                 values[mt_id] = _ui.metadata_input(mt, key=f"upload:meta:{mt_id}")
-    keep_failed = st.checkbox(
-        "Keep documents whose text extraction fails (you can retry extraction later)",
-        value=False,
-    )
     submitted = st.form_submit_button("Upload", type="primary")
 
 if submitted:
@@ -52,41 +48,29 @@ if submitted:
         progress = st.progress(0.0)
         created, failed = 0, []
         for i, up in enumerate(uploaded, start=1):
-            with st.spinner(f"Uploading and extracting text: {up.name} ({i}/{len(uploaded)})"):
+            with st.spinner(f"Uploading {up.name} ({i}/{len(uploaded)})"):
                 doc_id = write.new_id()
                 try:
-                    result = files.store_upload(up.getvalue(), up.name, up.type, doc_id, user)
+                    file_row = files.store_upload(up.getvalue(), up.name, up.type, doc_id, user)
                 except Exception as exc:
                     failed.append(f"{up.name}: upload failed — {exc}")
                     progress.progress(i / len(uploaded))
                     continue
-            if result.error and not keep_failed:
-                rel = result.file_row["stage_path"].removeprefix(f"{files.STAGE}/")
-                try:
-                    files.remove_files([rel])
-                except Exception:
-                    pass  # an orphan; admin cleanup will catch it
-                failed.append(f"{up.name}: text extraction failed, document not created — {result.error}")
-                progress.progress(i / len(uploaded))
-                continue
-            batch = {
+            _state.append_many({
                 "document_log": [write.document_row(
                     user, "create", doc_id, type_id,
                     os.path.splitext(up.name)[0], description or None, language or None,
                 )],
-                "document_file_log": [result.file_row],
-                "document_text": [result.text_row] if result.text_row else [],
+                "document_file_log": [file_row],
                 "metadata_log": [write.metadata_row(user, doc_id, mt_id, v)
                                  for mt_id, v in values.items() if v],
                 "tag_assignment_log": [write.tag_assignment_row(user, doc_id, t, True)
                                        for t in tag_ids],
-            }
-            _state.append_many(batch)
+            })
             created += 1
-            if result.error:
-                _state.flash(f"{up.name}: created without text — {result.error}", "warning")
-            for note in result.notes:
-                _state.flash(f"{up.name}: {note}", "info")
+            if not files.extractable(up.name):
+                _state.flash(f"{up.name}: no text extraction for this file type — the "
+                             "document is stored, but its content is not searchable.", "info")
             progress.progress(i / len(uploaded))
         for msg in failed:
             _state.flash(msg, "error")

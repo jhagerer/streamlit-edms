@@ -120,10 +120,10 @@ def test_missing_schema_points_to_setup_and_setup_creates_it(fake):
     at.switch_page("app_pages/setup.py").run()
     assert not at.exception, at.exception
     assert at.title[0].value == "Setup"
-    click(at.button, "Run all 8 statement(s) of this step")
+    click(at.button, "Run all 9 statement(s) of this step")
     at.run()
     assert not at.exception, at.exception
-    assert sum(q.startswith("CREATE TABLE") for q in fake.executed) == 8
+    assert sum(q.startswith("CREATE TABLE") for q in fake.executed) == 9
 
     at.switch_page("app_pages/documents.py").run()
     assert not at.exception, at.exception
@@ -213,3 +213,40 @@ def test_connection_change_blocked_with_pending_changes(fake):
     assert not at.exception, at.exception
     assert any("before you change the connection" in w.value for w in at.warning)
     assert not [b for b in at.button if b.label == "Connect for this browser session"]
+
+
+def test_text_tab_shows_task_status_and_retry_goes_through_the_stream(fake):
+    from datetime import datetime
+
+    seed(fake)
+    fake.tables["ocr_log"].append({
+        "event_id": "o1", "event_ts": datetime(2099, 1, 1), "actor": "system:ocr",
+        "file_id": "f1", "stage_path": "@doc_files/d1/f1.txt", "status": "failed",
+        "page_count": None, "message": "unsupported"})
+    fake.commits["ocr_log"] = 1
+    at = app()
+    at.query_params["doc"] = "d1"
+    at.switch_page("app_pages/document.py").run()
+    assert not at.exception, at.exception
+    assert any("Text extraction failed" in e.value for e in at.error)
+
+    click(at.button, "Request text extraction again")
+    at.run()
+    assert not at.exception, at.exception
+    click(at.sidebar.button, "Save to database")
+    at.run()
+    # The retry is a fresh document_file_log row: exactly what the stream feeds the task.
+    rows = [r for r in fake.tables["document_file_log"] if r["file_id"] == "f1"]
+    assert len(rows) == 2 and rows[-1]["active"] is True
+    assert not any("AI_PARSE_DOCUMENT" in q for q in fake.queries)
+
+
+def test_admin_text_extraction_tab(fake):
+    fake.task_state = "suspended"
+    at = app().run()
+    at.switch_page("app_pages/admin.py").run()
+    assert not at.exception, at.exception
+    assert any("suspended" in w.value for w in at.warning)
+    click(at.button, "Run extraction now")
+    at.run()
+    assert "EXECUTE TASK extract_text_task" in fake.executed

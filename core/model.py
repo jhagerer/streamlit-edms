@@ -164,3 +164,40 @@ def history(log: pl.DataFrame, **match: str) -> pl.DataFrame:
     for col, value in match.items():
         out = out.filter(pl.col(col) == value)
     return out.sort(["event_ts", "event_id"])
+
+
+TEXT_STATUS_LABELS = {
+    "unsaved": "Not saved yet — text is extracted after you save to the database.",
+    "waiting": "Saved — waiting for the extraction task to pick it up.",
+    "queued": "Queued — text extraction is running in Snowflake.",
+    "done": "Text extracted.",
+    "failed": "Text extraction failed.",
+    "skipped": "No text extraction for this file type.",
+}
+
+
+def file_text_status(files: pl.DataFrame, ocr_status: pl.DataFrame) -> pl.DataFrame:
+    """Add ``text_status``, ``ocr_message`` and ``ocr_pages`` to current files.
+
+    * unsaved — the file row (or a retry of it) is still pending in this session
+    * waiting — saved, but the task has not written a status yet, or the last
+      failed/skipped status is older than a later resubmission
+    * queued / done / failed / skipped — from ocr_status_v
+    """
+    files = files if "_pending" in files.columns else files.with_columns(
+        pl.lit(False).alias("_pending"))
+    ocr = ocr_status.select(
+        "file_id",
+        pl.col("status").alias("ocr_state"),
+        pl.col("event_ts").alias("ocr_ts"),
+        pl.col("message").alias("ocr_message"),
+        pl.col("page_count").alias("ocr_pages"),
+    )
+    out = files.join(ocr, on="file_id", how="left")
+    stale = pl.col("ocr_state").is_in(["failed", "skipped"]) & (pl.col("ocr_ts") < pl.col("event_ts"))
+    return out.with_columns(
+        pl.when(pl.col("_pending")).then(pl.lit("unsaved"))
+        .when(pl.col("ocr_state").is_null() | stale).then(pl.lit("waiting"))
+        .otherwise(pl.col("ocr_state"))
+        .alias("text_status")
+    ).drop("ocr_state", "ocr_ts")

@@ -81,10 +81,6 @@ def file_row(actor: str, *, document_id: str, file_id: str, filename: str, stage
                      checksum=checksum, page_count=page_count)
 
 
-def text_row(actor: str, file_id: str, content: str | None) -> dict:
-    return event_row(actor, file_id=file_id, content=content)
-
-
 def metadata_row(actor: str, document_id: str, metadata_type_id: str, value: str | None) -> dict:
     return event_row(actor, document_id=document_id, metadata_type_id=metadata_type_id,
                      value=value)

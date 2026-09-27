@@ -154,9 +154,7 @@ with tab_tags:
 
 # ── Files ────────────────────────────────────────────────────────────────────
 
-doc_files = model.current_files(_state.view("document_file_log")).filter(
-    pl.col("document_id") == doc_id
-)
+doc_files = _ui.file_status().filter(pl.col("document_id") == doc_id)
 
 with tab_files:
     if not doc_files.height:
@@ -165,10 +163,12 @@ with tab_files:
         with st.container(border=True):
             c1, c2, c3 = st.columns([4, 1, 1])
             c1.markdown(f"**{f['filename']}**" + ("  ● unsaved" if f["_pending"] else ""))
+            pages = f["ocr_pages"] or f["page_count"]
             c1.caption(
                 f"{f['mimetype']} · {_ui.fmt_size(f['size'])} · "
-                f"{f['page_count'] or '?'} page(s) · sha256 `{(f['checksum'] or '')[:16]}…`  \n"
-                f"added {f['event_ts']:%Y-%m-%d %H:%M} UTC by {f['actor']}"
+                f"{pages or '?'} page(s) · sha256 `{(f['checksum'] or '')[:16]}…`  \n"
+                f"added {f['event_ts']:%Y-%m-%d %H:%M} UTC by {f['actor']} · "
+                f"text: {f['text_status']}"
             )
             fk = f"{k}:file:{f['file_id']}"
             if c2.button("Download", key=f"{fk}:prep"):
@@ -189,49 +189,41 @@ with tab_files:
     with st.expander("Add a file to this document"):
         up = st.file_uploader("File", key=f"{k}:addfile")
         if up is not None and st.button("Upload file", key=f"{k}:addfile:go"):
-            with st.spinner("Uploading and extracting text…"):
+            with st.spinner("Uploading…"):
                 try:
-                    res = files.store_upload(up.getvalue(), up.name, up.type, doc_id, user)
+                    row = files.store_upload(up.getvalue(), up.name, up.type, doc_id, user)
                 except Exception as exc:
                     st.error(f"Upload failed: {exc}")
                     st.stop()
-            _state.append_many({
-                "document_file_log": [res.file_row],
-                "document_text": [res.text_row] if res.text_row else [],
-            })
-            if res.error:
-                _state.flash(f"Added without text — {res.error}", "warning")
+            _state.add_appends("document_file_log", [row])
             st.rerun()
 
 # ── Text ─────────────────────────────────────────────────────────────────────
 
 with tab_text:
-    tokens = _state.tokens()
-    committed = read.load_texts(tuple(doc_files["file_id"].to_list()), tokens["document_text"])
-    pending_txt = read.latest(_state.appends("document_text"), ["file_id"])
+    st.caption("Text is extracted in Snowflake by a triggered task (AI_PARSE_DOCUMENT) "
+               "after the file is saved to the database.")
+    committed = read.load_texts(tuple(doc_files["file_id"].to_list()),
+                                _state.tokens()["document_text"])
     for f in doc_files.iter_rows(named=True):
         st.markdown(f"**{f['filename']}**")
-        pend = pending_txt.filter(pl.col("file_id") == f["file_id"])
+        status = f["text_status"]
         comm = committed.filter(pl.col("file_id") == f["file_id"])
-        if pend.height:
-            st.caption("● Text not yet saved — not yet searchable.")
-            text = pend["content"][0]
-        elif comm.height:
-            text = comm["content"][0]
-        else:
-            text = None
-        if text is None:
-            st.info("No extracted text for this file.")
-        else:
-            st.text_area("Extracted text", text or "", height=300, disabled=True,
+        if status == "done" and comm.height:
+            st.text_area("Extracted text", comm["content"][0] or "", height=300, disabled=True,
                          key=f"{k}:text:{f['file_id']}", label_visibility="collapsed")
-        if st.button("Re-run text extraction", key=f"{k}:text:{f['file_id']}:retry"):
-            with st.spinner("Extracting text…"):
-                try:
-                    _state.add_appends("document_text", [files.retry_extraction(f, user)])
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"Extraction failed: {exc}")
+        else:
+            show = {"failed": st.error, "skipped": st.info}.get(status, st.info)
+            msg = model.TEXT_STATUS_LABELS.get(status, status)
+            if f["ocr_message"] and status in ("failed", "skipped"):
+                msg += f" {f['ocr_message']}"
+            show(msg)
+        if status in ("failed", "waiting") and not f["_pending"]:
+            if st.button("Request text extraction again", key=f"{k}:text:{f['file_id']}:retry",
+                         help="Adds a new entry for this file; after Save to database the "
+                              "extraction task picks it up."):
+                _state.add_appends("document_file_log", [files.resubmit_row(f, user)])
+                st.rerun()
 
 # ── History ──────────────────────────────────────────────────────────────────
 
@@ -258,6 +250,10 @@ with tab_hist:
             pl.when(pl.col("active")).then(pl.lit("file")).otherwise(pl.lit("file removed")).alias("event"),
             pl.col("filename").alias("detail"), "_pending"),
     ]
+    ocr = _state.ocr_status().join(doc_files.select("file_id", "filename"), on="file_id")
+    parts.append(ocr.select(
+        "event_ts", "actor", pl.concat_str([pl.lit("text "), pl.col("status")]).alias("event"),
+        pl.col("filename").alias("detail"), pl.lit(False).alias("_pending")))
     hist = pl.concat(parts, how="vertical_relaxed").sort("event_ts", descending=True)
     st.dataframe(
         hist.with_columns(

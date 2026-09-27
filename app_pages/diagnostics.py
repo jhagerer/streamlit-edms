@@ -6,7 +6,7 @@ import streamlit as st
 
 from app_pages import _state
 from core import read
-from core.schema import APPEND_TABLES, KEYS, READ_TABLES
+from core.schema import KEYS, READ_TABLES, TOKEN_TABLES
 from core.session import get_session, runtime, slug, user_tokens
 
 st.title("Diagnostics")
@@ -37,7 +37,7 @@ st.json(_state.tokens())
 st.subheader("Tables")
 tokens = _state.tokens()
 rows = []
-for t in APPEND_TABLES:
+for t in TOKEN_TABLES:
     if t in READ_TABLES:
         start = time.perf_counter()
         df = read.load_log(t, tokens[t])

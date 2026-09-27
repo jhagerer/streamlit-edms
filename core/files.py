@@ -1,8 +1,13 @@
-"""@doc_files: immutable uploads plus inline text extraction.
+"""@doc_files: immutable, content-addressed uploads.
 
-File bytes land in the stage immediately at upload; the log rows wait for
-"Save to database". A discarded session therefore leaves orphaned files, which
-the admin page can clean up.
+File bytes land in the stage immediately at upload, at
+``@doc_files/{sha256}/{filename}``; the document_file_log row that references
+them waits for "Save to database". A discarded session therefore leaves
+orphaned files, which the admin page can clean up.
+
+Text extraction does NOT happen here. Once the rows are saved, a stream on
+document_file_log fires a triggered task in Snowflake that runs
+AI_PARSE_DOCUMENT (see extract_text() in sql/minidms-setup.sql).
 """
 
 from __future__ import annotations
@@ -12,7 +17,6 @@ import io
 import mimetypes
 import os
 import re
-from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 import polars as pl
@@ -22,21 +26,10 @@ from core.session import cache_data, get_session
 
 STAGE = "@doc_files"
 
-# Formats AI_PARSE_DOCUMENT accepts.
+# Formats AI_PARSE_DOCUMENT accepts; others are marked 'skipped' by the task.
+# Keep in sync with the extension list in extract_text().
 CORTEX_EXTENSIONS = {".pdf", ".docx", ".pptx", ".jpeg", ".jpg", ".png", ".tif", ".tiff",
                      ".html", ".htm", ".txt"}
-# Read directly, no Cortex call needed.
-PLAIN_TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".json", ".xml", ".log", ".yaml", ".yml"}
-
-PARSE_MODE = os.environ.get("MINIDMS_PARSE_MODE", "OCR")  # OCR | LAYOUT
-
-
-@dataclass
-class UploadResult:
-    file_row: dict
-    text_row: dict | None
-    error: str | None = None
-    notes: list[str] = field(default_factory=list)
 
 
 def safe_ext(filename: str) -> str:
@@ -44,9 +37,22 @@ def safe_ext(filename: str) -> str:
     return ext if re.fullmatch(r"\.[a-z0-9]{1,8}", ext) else ""
 
 
-def relative_path(document_id: str, file_id: str, filename: str) -> str:
-    # The extension is kept: AI_PARSE_DOCUMENT detects the format from it.
-    return f"{document_id}/{file_id}{safe_ext(filename)}"
+def safe_filename(filename: str) -> str:
+    """A stage-path-safe version of the original name. Keeps the extension
+    (AI_PARSE_DOCUMENT detects the format from it); the original name is kept
+    unchanged in document_file_log.filename."""
+    base = os.path.basename(filename.replace("\\", "/")).strip()
+    stem, ext = os.path.splitext(base)
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._-")[:120] or "file"
+    return stem + safe_ext(base)
+
+
+def relative_path(checksum: str, filename: str) -> str:
+    """{sha256}/{filename}: identical content under the same name maps to the
+    same path, so re-uploading a file does not store it twice."""
+    if not re.fullmatch(r"[0-9a-f]{64}", checksum):
+        raise ValueError("checksum must be a lower-case sha256 hex digest")
+    return f"{checksum}/{safe_filename(filename)}"
 
 
 def sha256_hex(data: bytes) -> str:
@@ -58,88 +64,38 @@ def guess_mimetype(filename: str, declared: str | None = None) -> str:
 
 
 def put_file(data: bytes, rel_path: str, session=None) -> str:
+    """Stage the bytes. overwrite=False is deliberate here: the path is derived
+    from the content, so an existing file already holds exactly these bytes."""
     session = session or get_session()
     stage_path = f"{STAGE}/{rel_path}"
-    session.file.put_stream(io.BytesIO(data), stage_path, auto_compress=False, overwrite=True)
+    session.file.put_stream(io.BytesIO(data), stage_path, auto_compress=False, overwrite=False)
     return stage_path
 
 
-def _decode_text(data: bytes) -> str:
-    for enc in ("utf-8", "utf-16", "latin-1"):
-        try:
-            return data.decode(enc)
-        except UnicodeDecodeError:
-            continue
-    return data.decode("utf-8", errors="replace")
-
-
-def extract_text(rel_path: str, session=None, mode: str | None = None) -> tuple[str, int | None]:
-    """AI_PARSE_DOCUMENT on one staged file. Returns (content, page_count).
-    Raises on failure."""
-    session = session or get_session()
-    mode = (mode or PARSE_MODE).upper()
-    if mode not in ("OCR", "LAYOUT"):
-        raise ValueError(f"bad parse mode {mode!r}")
-    row = session.sql(
-        "SELECT r:content::VARCHAR, r:metadata:pageCount::INT, r:errorInformation::VARCHAR "
-        f"FROM (SELECT AI_PARSE_DOCUMENT(TO_FILE('{STAGE}', ?), {{'mode': '{mode}'}}) AS r)",
-        params=[rel_path],
-    ).collect()[0]
-    content, pages, err = row[0], row[1], row[2]
-    if err and not content:
-        raise RuntimeError(f"AI_PARSE_DOCUMENT: {err}")
-    return content or "", pages
-
-
-def extract_for(filename: str, data: bytes | None, rel_path: str, session=None) -> tuple[str | None, int | None, str | None]:
-    """Pick the extraction route by extension. Returns (text, page_count, note)."""
-    ext = safe_ext(filename)
-    if ext in PLAIN_TEXT_EXTENSIONS and data is not None:
-        return _decode_text(data), None, None
-    if ext in CORTEX_EXTENSIONS:
-        text, pages = extract_text(rel_path, session)
-        return text, pages, None
-    return None, None, f"No text extraction for '{ext or 'no extension'}' files."
+def extractable(filename: str) -> bool:
+    return safe_ext(filename) in CORTEX_EXTENSIONS
 
 
 def store_upload(data: bytes, filename: str, declared_type: str | None, document_id: str,
-                 actor: str, session=None) -> UploadResult:
-    """Stage the bytes, extract text inline, return the log rows to append.
-
-    Staging failures raise. Extraction failures are returned in ``error`` with
-    ``text_row=None`` so the caller decides whether to keep the document."""
-    session = session or get_session()
-    file_id = write.new_id()
-    rel = relative_path(document_id, file_id, filename)
-    stage_path = put_file(data, rel, session)
-
-    text, pages, error, notes = None, None, None, []
-    try:
-        text, pages, note = extract_for(filename, data, rel, session)
-        if note:
-            notes.append(note)
-    except Exception as exc:  # Cortex failed; the bytes are already staged.
-        error = str(exc)
-
-    file_row = write.file_row(
-        actor, document_id=document_id, file_id=file_id, filename=filename,
+                 actor: str, session=None) -> dict:
+    """Stage the bytes and return the document_file_log row to append.
+    Staging failures raise; nothing is appended then."""
+    checksum = sha256_hex(data)
+    stage_path = put_file(data, relative_path(checksum, filename), session)
+    return write.file_row(
+        actor, document_id=document_id, file_id=write.new_id(), filename=filename,
         stage_path=stage_path, mimetype=guess_mimetype(filename, declared_type),
-        size=len(data), checksum=sha256_hex(data), page_count=pages,
+        size=len(data), checksum=checksum, page_count=None,
     )
-    text_row = write.text_row(actor, file_id, text) if text is not None else None
-    return UploadResult(file_row, text_row, error, notes)
 
 
-def retry_extraction(file: dict, actor: str, session=None) -> dict:
-    """Re-run extraction for a staged file; returns a document_text row."""
-    rel = str(file["stage_path"]).removeprefix(f"{STAGE}/")
-    data = None
-    if safe_ext(file["filename"] or "") in PLAIN_TEXT_EXTENSIONS:
-        data = get_bytes(file["stage_path"], session)
-    text, _, note = extract_for(file["filename"] or rel, data, rel, session)
-    if text is None:
-        raise RuntimeError(note or "no text")
-    return write.text_row(actor, file["file_id"], text)
+def resubmit_row(file: dict, actor: str) -> dict:
+    """Request text extraction again: a fresh, identical snapshot of the file
+    row. Once saved, the stream picks it up and the task queues the file
+    (only if it has no text yet)."""
+    return write.file_row(actor, active=True, **{c: file[c] for c in (
+        "document_id", "file_id", "filename", "stage_path", "mimetype", "size",
+        "checksum", "page_count")})
 
 
 def get_bytes(stage_path: str, session=None) -> bytes:
@@ -183,12 +139,31 @@ def orphans(staged: pl.DataFrame, referenced_paths: set[str], min_age_days: int,
     )
 
 
+_MANAGED = re.compile(r"^([0-9a-f]{64})/([A-Za-z0-9._-]+)$")
+
+
+def remove_statement(rel: str) -> str | None:
+    """REMOVE for exactly one managed file. REMOVE matches by prefix, so the
+    folder is given as the path and the file name as an anchored PATTERN —
+    otherwise removing '<sha>/a.pd' would also remove '<sha>/a.pdf'. Paths
+    that do not look like '{sha256}/{safe name}' are never touched. Pure."""
+    m = _MANAGED.match(rel)
+    if not m:
+        return None
+    pattern = ".*/" + re.escape(m.group(2)) + "$"
+    pattern = pattern.replace("\\", "\\\\")  # SQL string literal escaping
+    return f"REMOVE {STAGE}/{m.group(1)}/ PATTERN = '{pattern}'"
+
+
 def remove_files(relative_paths: list[str], session=None) -> int:
     session = session or get_session()
+    removed = 0
     for rel in relative_paths:
-        quoted = f"{STAGE}/{rel}".replace("'", "\\'")
-        session.sql(f"REMOVE '{quoted}'").collect()
-    return len(relative_paths)
+        stmt = remove_statement(rel)
+        if stmt:
+            session.sql(stmt).collect()
+            removed += 1
+    return removed
 
 
 @cache_data(max_entries=16, ttl=600)

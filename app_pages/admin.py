@@ -2,14 +2,15 @@ import polars as pl
 import streamlit as st
 
 from app_pages import _state, _ui
-from core import files, read, snapshot, write
+from core import files, ocr, read, snapshot, write
 from core.schema import KEYS, READ_TABLES
 from core.session import slug
 
 st.title("Admin")
 
-tab_pending, tab_snap, tab_counts, tab_orphans, tab_cost = st.tabs(
-    ["My pending changes", "Session snapshots", "Log sizes", "Orphaned files", "Cost"]
+tab_pending, tab_snap, tab_ocr, tab_counts, tab_orphans, tab_cost = st.tabs(
+    ["My pending changes", "Session snapshots", "Text extraction", "Log sizes",
+     "Orphaned files", "Cost"]
 )
 
 with tab_pending:
@@ -46,6 +47,51 @@ with tab_snap:
             for folder in stale["folder"].to_list():
                 snapshot.remove_folder(folder)
             st.success(f"Removed {stale.height} folder(s).")
+
+with tab_ocr:
+    st.caption("Saving files to the database feeds the stream `document_file_log_stream`; "
+               "the triggered task `extract_text_task` then runs `extract_text()`, which "
+               "calls AI_PARSE_DOCUMENT in Snowflake.")
+    try:
+        task = ocr.task_state()
+    except Exception as exc:
+        task = None
+        st.error(f"Could not read the task: {exc}")
+    if task is None:
+        st.warning("The extraction task does not exist or is not visible to this role. "
+                   "Run the *Text extraction* step on the Setup page.")
+    else:
+        state = str(task.get("state", "?"))
+        (st.success if state.lower() == "started" else st.warning)(
+            f"Task `{ocr.TASK}` is **{state}**."
+            + ("" if state.lower() == "started" else
+               " New files are not processed until it is resumed (Setup page).")
+        )
+    status = _state.ocr_status()
+    counts = ocr.status_counts(status)
+    waiting = _ui.file_status().filter(pl.col("text_status") == "waiting").height
+    cols = st.columns(5)
+    for col, key in zip(cols, ("queued", "done", "failed", "skipped")):
+        col.metric(key.capitalize(), counts.get(key, 0))
+    cols[4].metric("Waiting", waiting, help="Saved files without a status yet.")
+    failed = status.filter(pl.col("status") == "failed")
+    if failed.height:
+        st.markdown("**Failed files** (retry from the document's *Text* tab)")
+        st.dataframe(failed.select("event_ts", "file_id", "stage_path", "message"),
+                     hide_index=True)
+    c1, c2 = st.columns(2)
+    if c1.button("Run extraction now", help="EXECUTE TASK — normally not needed, the task "
+                                           "fires by itself when files are saved."):
+        try:
+            ocr.run_now()
+            st.success("Task started. Results appear here when it finishes.")
+        except Exception as exc:
+            st.error(f"Could not start the task: {exc}")
+    if c2.button("Show recent task runs"):
+        try:
+            st.dataframe(ocr.recent_runs(), hide_index=True)
+        except Exception as exc:
+            st.error(f"Could not read the task history: {exc}")
 
 with tab_counts:
     st.caption("Raw events vs. current records. Memory grows with raw rows; once the logs "

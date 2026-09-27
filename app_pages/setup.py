@@ -90,23 +90,25 @@ except Exception as exc:
     st.stop()
 missing = setup.missing(existing)
 n_missing = sum(len(v) for v in missing.values())
-total = len(setup.STAGES) + len(setup.APPEND_TABLES) + len(setup.VIEWS)
+total = setup.total_needed()
 st.progress((total - n_missing) / total,
             text=f"{total - n_missing} of {total} MiniDMS objects exist in "
                  f"{ctx['database']}.{ctx['schema']}")
 if not n_missing:
     st.success("The schema is complete.", icon="✅")
 
-# ── Steps 2–4: the schema script ─────────────────────────────────────────────
+# ── Schema steps from the setup script ───────────────────────────────────────
 
-for i, step in enumerate(setup.steps(), start=2):
+schema_steps = setup.steps()
+for i, step in enumerate(schema_steps, start=2):
     todo = [s for s in step.statements if s.name and s.name not in existing.get(s.kind, set())]
     icon = "✅" if not todo else "⬜"
     st.header(f"{i} · {step.title} {icon}")
     st.caption(step.description)
     for j, stmt in enumerate(step.statements):
         exists = stmt.name in existing.get(stmt.kind, set()) if stmt.name else None
-        label = f"{stmt.kind or 'statement'} `{stmt.name or j}`"
+        label = (f"task `{stmt.name}` started" if stmt.kind == "resume"
+                 else f"{stmt.kind or 'statement'} `{stmt.name or j}`")
         with st.expander(f"{'✅' if exists else '⬜'} {label}", expanded=False):
             st.code(stmt.sql, language="sql")
             if st.button("Run", key=f"setup:{step.key}:{j}", disabled=not allowed):
@@ -117,9 +119,10 @@ for i, step in enumerate(setup.steps(), start=2):
                  disabled=not allowed):
         run_all(step.statements, step.title)
 
-# ── Step 5: grants (optional) ────────────────────────────────────────────────
+# ── Grants (optional) ────────────────────────────────────────────────────────
 
-st.header("5 · Grants for the app role (optional)")
+n = len(schema_steps) + 2
+st.header(f"{n} · Grants for the app role (optional)")
 st.caption("Only needed when the app runs with a role that does not own the objects. "
            "Grants SELECT and INSERT but no UPDATE or DELETE, so the database enforces "
            "append-only. Needs a role that may grant these privileges.")
@@ -135,9 +138,9 @@ if role:
     except ValueError as exc:
         st.error(str(exc))
 
-# ── Step 6: PyPI access (SiS container runtime) ──────────────────────────────
+# ── PyPI access (SiS container runtime) ──────────────────────────────
 
-st.header("6 · PyPI access for Streamlit in Snowflake (optional)")
+st.header(f"{n + 1} · PyPI access for Streamlit in Snowflake (optional)")
 st.caption("Only for the SiS container runtime, which installs requirements.txt from PyPI. "
            "Usually needs ACCOUNTADMIN. The network rule is created in the current schema.")
 pypi_role = st.text_input("Grant usage on the integration to role (optional)", key="setup:pypi:role")
@@ -149,9 +152,9 @@ try:
 except ValueError as exc:
     st.error(str(exc))
 
-# ── Step 7: create the Streamlit object (copy only) ──────────────────────────
+# ── Create the Streamlit object (copy only) ──────────────────────────
 
-st.header("7 · Create the Streamlit app in Snowflake (optional)")
+st.header(f"{n + 2} · Create the Streamlit app in Snowflake (optional)")
 st.caption("Shown for copying — where the source files live depends on your setup "
            "(Workspace, Git repository or stage). Verify the options against the "
            "Snowflake documentation.")
@@ -161,9 +164,9 @@ pool = c2.text_input("Compute pool", value="<compute_pool>")
 qwh = c3.text_input("Query warehouse", value=ctx["warehouse"] or "<warehouse>")
 st.code(setup.create_streamlit_sql("minidms", src, qwh, pool), language="sql")
 
-# ── Step 8: starter data (optional) ──────────────────────────────────────────
+# ── Starter data (optional) ──────────────────────────────────────────
 
-st.header("8 · Starter definitions (optional)")
+st.header(f"{n + 3} · Starter definitions (optional)")
 st.caption("Adds a few document types, metadata types and tags as normal pending "
            "changes. Click **Save to database** in the sidebar to keep them.")
 if n_missing:

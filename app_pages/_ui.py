@@ -14,7 +14,8 @@ DOCUMENT_PAGE = "app_pages/document.py"
 
 SAVE_COPY = (
     "Files upload immediately; entries are saved when you click "
-    "**Save to database**. **Save to session** keeps your unsaved work safe "
+    "**Save to database**. Text (OCR) is extracted in Snowflake after that, "
+    "usually within a minute. **Save to session** keeps your unsaved work safe "
     "if the browser closes."
 )
 
@@ -112,6 +113,14 @@ def document_table() -> pl.DataFrame:
         _state.view("metadata_log"),
         _state.view("tag_assignment_log"),
         _state.view("tag_log"),
+    )
+
+
+def file_status(include_inactive: bool = False) -> pl.DataFrame:
+    """Current files with their text-extraction status."""
+    return model.file_text_status(
+        model.current_files(_state.view("document_file_log"), include_inactive),
+        _state.ocr_status(),
     )
 
 

@@ -3,7 +3,9 @@
 All reads are bulk. Each table is loaded whole into a polars frame, keyed on
 its change token, and shared by every viewer through the Streamlit cache. The
 UI never issues per-interaction queries except the token probe (and the
-Text tab / search, which touch ``document_text``).
+Text tab / search, which touch ``document_text``). ``document_text`` and
+``ocr_log`` are written only by the extraction task inside Snowflake; the app
+reads them.
 """
 
 from __future__ import annotations
@@ -13,7 +15,7 @@ import time
 import polars as pl
 
 from core import schema
-from core.schema import APPEND_TABLES, READ_TABLES
+from core.schema import APPEND_TABLES, READ_TABLES, TOKEN_TABLES
 from core.session import cache_data, get_session
 
 # ── Tokens ───────────────────────────────────────────────────────────────────
@@ -39,15 +41,15 @@ def change_tokens() -> dict[str, str]:
     Each token starts with the connection scope (account/role/database/schema),
     so viewers on different connections never share a cached frame."""
     session = get_session()
-    cols = ", ".join(f"SYSTEM$LAST_CHANGE_COMMIT_TIME('{t}')" for t in APPEND_TABLES)
+    cols = ", ".join(f"SYSTEM$LAST_CHANGE_COMMIT_TIME('{t}')" for t in TOKEN_TABLES)
     try:
         row = session.sql(f"SELECT {_SCOPE_SQL}, {cols}").collect()[0]
         scope = "/".join(str(v) for v in row[:4])
-        return {t: f"{scope}|{row[4 + i]}" for i, t in enumerate(APPEND_TABLES)}
+        return {t: f"{scope}|{row[4 + i]}" for i, t in enumerate(TOKEN_TABLES)}
     except Exception:
         row = session.sql(f"SELECT {_SCOPE_SQL}").collect()[0]
         scope = "/".join(str(v) for v in row[:4])
-        return {t: f"{scope}|{_probe_one(session, t)}" for t in APPEND_TABLES}
+        return {t: f"{scope}|{_probe_one(session, t)}" for t in TOKEN_TABLES}
 
 
 def time_probe(n: int = 20) -> float:
@@ -82,13 +84,20 @@ def load_log(table: str, token: str) -> pl.DataFrame:
 
 @cache_data
 def load_event_ids(table: str, token: str) -> pl.DataFrame:
-    """Ids only — for tables too large to bulk-load (document_text)."""
-    if table not in APPEND_TABLES:
+    """Ids only — for tables too large to bulk-load."""
+    if table not in TOKEN_TABLES:
         raise ValueError(f"unknown table {table}")
     df = query_frame(f"SELECT event_id FROM {table}")
     if not df.width:
         return pl.DataFrame(schema={"event_id": pl.Utf8})
     return df.rename({df.columns[0]: "event_id"}).select(pl.col("event_id").cast(pl.Utf8))
+
+
+@cache_data
+def load_ocr_status(token: str) -> pl.DataFrame:
+    """Latest extraction status per file (ocr_status_v): one short row per
+    file, so it is bulk-loaded like the logs."""
+    return schema.conform("ocr_log", query_frame("SELECT * FROM ocr_status_v"))
 
 
 @cache_data
@@ -160,11 +169,7 @@ def restore(user: str, tokens: dict[str, str]) -> dict[str, pl.DataFrame]:
         snap = snaps.get(table)
         if snap is None:
             continue
-        committed = (
-            load_log(table, tokens[table])
-            if table in READ_TABLES
-            else load_event_ids(table, tokens[table])
-        )
+        committed = load_log(table, tokens[table])
         mine = clean_restored(schema.conform(table, snap), committed)
         if mine is not None and mine.height:
             restored[table] = mine

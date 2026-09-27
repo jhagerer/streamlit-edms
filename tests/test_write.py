@@ -32,7 +32,6 @@ def test_builders_produce_valid_rows_for_every_table():
         "document_type_log": write.document_type_row(u, "dt", "Invoice"),
         "metadata_type_log": write.metadata_type_row(u, "m", "amount", "Amount", "number", None, None),
         "tag_log": write.tag_row(u, "t", "Red", "#ff0000"),
-        "document_text": write.text_row(u, "f", "hello"),
     }
     assert set(rows) == set(schema.APPEND_TABLES)
     for table, row in rows.items():

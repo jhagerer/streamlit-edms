@@ -67,7 +67,7 @@ class _SpDF:
 class FakeSession:
     def __init__(self):
         self.stage: dict[str, bytes] = {}
-        self.tables: dict[str, list[dict]] = {t: [] for t in schema.APPEND_TABLES}
+        self.tables: dict[str, list[dict]] = {t: [] for t in schema.TOKEN_TABLES}
         self.commits: dict[str, int] = {}
         self.fail_remove = False
         self.fail_insert_on: str | None = None
@@ -75,17 +75,19 @@ class FakeSession:
         self.queries: list[str] = []
         self.schema_missing = False  # simulate a fresh schema without MiniDMS objects
         self.offline = False  # simulate "no connection configured"
+        self.task_state = "started"
         self.closed = False
         self.executed: list[str] = []
 
     def create_dataframe(self, rows, schema=None):
         return _SpDF(self, rows, schema)
 
-    def _arrow(self, table, cols=None):
+    def _arrow(self, table, cols=None, rows=None):
         pa_schema = {"event_ts": pa.timestamp("us"), "size": pa.int64(), "page_count": pa.int64(),
                      "active": pa.bool_(), "assigned": pa.bool_()}
         names = cols or schema.columns(table)
-        data = {c.upper(): [r.get(c) for r in self.tables[table]] for c in names}
+        rows = self.tables[table] if rows is None else rows
+        data = {c.upper(): [r.get(c) for r in rows] for c in names}
         return pa.table({k: pa.array(v, type=pa_schema.get(k.lower(), pa.string()))
                          for k, v in data.items()})
 
@@ -97,7 +99,14 @@ class FakeSession:
             raise RuntimeError("Missing Snowflake connection configuration")
         self.queries.append(query)
         q = query.strip()
-        if q.startswith(("CREATE", "GRANT", "USE")):
+        if q.startswith("SHOW TASKS"):
+            return _Result([] if self.schema_missing else
+                           [Row(name="EXTRACT_TEXT_TASK", state=self.task_state)])
+        if q.startswith("SHOW STREAMS"):
+            return _Result([] if self.schema_missing else [Row(name="DOCUMENT_FILE_LOG_STREAM")])
+        if "information_schema.procedures" in q:
+            return _Result([] if self.schema_missing else [("extract_text",)])
+        if q.startswith(("CREATE", "GRANT", "USE", "ALTER", "EXECUTE")):
             self.executed.append(q)
             if q.startswith("CREATE TABLE"):
                 self.schema_missing = False
@@ -105,7 +114,8 @@ class FakeSession:
         if "information_schema.tables" in q:
             if self.schema_missing:
                 return _Result([])
-            return _Result([(t, "BASE TABLE") for t in self.tables] + [("audit_v", "VIEW")])
+            return _Result([(t, "BASE TABLE") for t in self.tables]
+                           + [("audit_v", "VIEW"), ("ocr_status_v", "VIEW")])
         if "information_schema.stages" in q:
             return _Result([] if self.schema_missing else [("doc_files",), ("sessions",)])
         if self.schema_missing and ("SYSTEM$" in q or "FROM" in q) and "CURRENT_USER()" not in q:
@@ -127,6 +137,11 @@ class FakeSession:
             return _Result([scope + tuple(self.commits.get(t, 0) for t in re.findall(r"'(\w+)'", q))])
         if scope and "FROM" not in q:
             return _Result([scope])
+        if q == "SELECT * FROM ocr_status_v":
+            latest = {}
+            for r in sorted(self.tables["ocr_log"], key=lambda r: (r["event_ts"], r["event_id"])):
+                latest[r["file_id"]] = r
+            return _Result(arrow=self._arrow("ocr_log", rows=list(latest.values())))
         m = re.fullmatch(r"SELECT \* FROM (\w+)", q)
         if m:
             return _Result(arrow=self._arrow(m.group(1)))
