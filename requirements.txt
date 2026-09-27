@@ -1,0 +1,7 @@
+# Streamlit in Snowflake, container runtime: installed from PyPI (needs the
+# PyPI external access integration). Pin these; the reduction leans on
+# version-sensitive API.
+polars==1.*
+pyarrow>=15
+streamlit>=1.50
+snowflake-snowpark-python>=1.30

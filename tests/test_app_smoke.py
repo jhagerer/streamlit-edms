@@ -1,0 +1,111 @@
+"""Render every page against the fake session. Catches errors in page code
+without a Snowflake account."""
+
+import pytest
+from streamlit.testing.v1 import AppTest
+
+PAGES = {"documents": "Documents", "upload": "Upload", "search": "Search", "trash": "Trash",
+         "document": "Document", "document_types": "Document types",
+         "metadata_types": "Metadata types", "tags": "Tags", "audit": "Audit trail",
+         "admin": "Admin", "diagnostics": "Diagnostics"}
+
+
+def app():
+    return AppTest.from_file("../streamlit_app.py", default_timeout=30)
+
+
+@pytest.mark.parametrize("page", PAGES)
+def test_page_renders(fake, page):
+    at = app().run()
+    at.switch_page(f"app_pages/{page}.py").run()
+    assert not at.exception, at.exception
+    assert at.title[0].value == PAGES[page]
+
+
+def click(buttons, label):
+    matches = [b for b in buttons if b.label == label]
+    assert matches, f"no button {label!r}: {[b.label for b in buttons]}"
+    matches[0].click()
+
+
+def test_create_tag_and_flush(fake):
+    at = app().run()
+    at.switch_page("app_pages/tags.py").run()
+    at.text_input[0].input("Urgent")
+    click(at.button, "Add")
+    at.run()
+    assert not at.exception, at.exception
+    assert any("Urgent" == t.value for t in at.text_input), [t.value for t in at.text_input]
+    assert any("1 unsaved" in w.value for w in at.sidebar.warning)
+
+    click(at.sidebar.button, "Save to database")
+    at.run()
+    assert not at.exception, at.exception
+    assert [r["label"] for r in fake.tables["tag_log"]] == ["Urgent"]
+    assert at.sidebar.success[0].value == "All changes saved."
+
+
+def test_save_to_session_then_restore_in_new_browser_session(fake):
+    at = app().run()
+    at.switch_page("app_pages/document_types.py").run()
+    at.text_input[0].input("Invoice")
+    click(at.button, "Add")
+    at.run()
+    click(at.sidebar.button, "Save to session")
+    at.run()
+    assert not at.exception, at.exception
+    assert any(k.startswith("sessions/alice/") for k in fake.stage)
+    assert fake.tables["document_type_log"] == []
+
+    fresh = app().run()  # a new browser session: restore on entry
+    assert not fresh.exception, fresh.exception
+    assert any("1 change(s) saved to session" in m.value for m in fresh.sidebar.info)
+    fresh.switch_page("app_pages/document_types.py").run()
+    assert any(t.value == "Invoice" for t in fresh.text_input)
+
+
+def seed(fake):
+    from core import write
+
+    u = "bob"
+    rows = {
+        "document_type_log": [write.document_type_row(u, "t1", "Invoice")],
+        "document_log": [write.document_row(u, "create", "d1", "t1", "Invoice 42", "desc", "en")],
+        "document_file_log": [write.file_row(u, document_id="d1", file_id="f1", filename="a.txt",
+                                             stage_path="@doc_files/d1/f1.txt", mimetype="text/plain",
+                                             size=5, checksum="x", page_count=None)],
+        "metadata_type_log": [write.metadata_type_row(u, "m1", "amount", "Amount", "number", None, None)],
+        "metadata_log": [write.metadata_row(u, "d1", "m1", "12.5")],
+        "tag_log": [write.tag_row(u, "red", "Red", "#ff0000")],
+        "tag_assignment_log": [write.tag_assignment_row(u, "d1", "red", True)],
+    }
+    for table, rs in rows.items():
+        fake.tables[table].extend(rs)
+        fake.commits[table] = 1
+    fake.stage["doc_files/d1/f1.txt"] = b"hello"
+
+
+def test_document_list_and_detail(fake):
+    seed(fake)
+    at = app().run()
+    assert not at.exception, at.exception
+    assert at.dataframe[0].value["label"].tolist() == ["Invoice 42"]
+
+    at.switch_page("app_pages/document.py")
+    at.query_params["doc"] = "d1"
+    at.run()
+    assert not at.exception, at.exception
+    assert at.title[0].value == "Invoice 42"
+
+    click(at.button, "Move to trash")
+    at.run()
+    assert not at.exception, at.exception
+    assert at.title[0].value.startswith("🗑️")
+    click(at.sidebar.button, "Save to database")
+    at.run()
+    assert [r["op"] for r in fake.tables["document_log"]] == ["create", "trash"]
+    assert [r["actor"] for r in fake.tables["document_log"]] == ["bob", "alice"]
+
+    at.switch_page("app_pages/documents.py").run()
+    assert not at.exception, at.exception
+    assert not at.dataframe  # nothing left in the active list
