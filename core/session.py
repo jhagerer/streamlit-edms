@@ -58,10 +58,46 @@ def in_sis() -> bool:
     return runtime() == "sis"
 
 
+def _pem_to_der_b64(pem: str, passphrase: str | None = None) -> str:
+    """The connector wants a key as base64 DER; secrets usually hold PEM."""
+    import base64
+
+    from cryptography.hazmat.primitives import serialization
+
+    key = serialization.load_pem_private_key(
+        pem.strip().encode(), password=passphrase.encode() if passphrase else None
+    )
+    der = key.private_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    return base64.b64encode(der).decode()
+
+
+def _connection_overrides(conn_name: str) -> dict[str, Any]:
+    """Extra kwargs for st.connection. Lets a hosted app (e.g. Streamlit
+    Community Cloud) keep a PEM private key directly in its secrets."""
+    try:
+        cfg = st.secrets.get("connections", {}).get(conn_name, {})
+    except Exception:
+        return {}
+    pem = cfg.get("private_key")
+    if isinstance(pem, str) and pem.lstrip().startswith("-----BEGIN"):
+        return {
+            "private_key": _pem_to_der_b64(pem, cfg.get("private_key_passphrase")),
+            "private_key_passphrase": None,
+            "authenticator": cfg.get("authenticator", "SNOWFLAKE_JWT"),
+        }
+    return {}
+
+
 @st.cache_resource(show_spinner="Connecting to Snowflake…")
 def _local_session():
     conn_name = os.environ.get("MINIDMS_CONNECTION", "snowflake")
-    session = st.connection(conn_name, type="snowflake").session()
+    session = st.connection(
+        conn_name, type="snowflake", **_connection_overrides(conn_name)
+    ).session()
     # Optional overrides, handy when the connection has no default db/schema.
     for env, kind in (
         ("MINIDMS_WAREHOUSE", "WAREHOUSE"),
@@ -105,6 +141,10 @@ def actor() -> str:
     if in_sis():
         # Never fall back to CURRENT_USER() in SiS: it is the app owner.
         name = _st_user_name() or os.environ.get("MINIDMS_USER")
+    elif auth_configured():
+        # Shared deployment: everyone connects as one service user, so
+        # CURRENT_USER() would merge all viewers. Use the logged-in identity.
+        name = _st_user_name() if is_logged_in() else None
     else:
         name = (
             os.environ.get("MINIDMS_USER")
@@ -113,10 +153,59 @@ def actor() -> str:
         )
     if not name:
         raise RuntimeError(
-            "Cannot determine the viewer. st.user.user_name is empty — "
-            "set MINIDMS_USER or check the Streamlit runtime."
+            "Cannot determine the viewer: st.user is empty (not logged in?). "
+            "Set MINIDMS_USER or check the Streamlit runtime."
         )
     return name
+
+
+def auth_configured() -> bool:
+    """True when Streamlit's OIDC login ([auth] in secrets) is set up — the case
+    for a shared hosted deployment such as Streamlit Community Cloud, where
+    everyone uses the same Snowflake service user."""
+    try:
+        return "auth" in st.secrets
+    except Exception:
+        return False
+
+
+def is_logged_in() -> bool:
+    try:
+        return bool(st.user.is_logged_in)
+    except Exception:
+        return False
+
+
+def _setting(name: str) -> str:
+    value = os.environ.get(name)
+    if value is None:
+        try:
+            value = st.secrets.get(name)
+        except Exception:
+            value = None
+    return str(value or "")
+
+
+def setup_allowed() -> tuple[bool, str]:
+    """Who may run DDL and grants from the Setup page.
+
+    * MINIDMS_SETUP_USERS (comma-separated, env or secrets) wins if set.
+    * In SiS: only the app owner (the viewer equals CURRENT_USER()).
+    * Shared deployment with login: nobody unless listed.
+    * Plain local run: yes — it is your own connection.
+    """
+    listed = [u.strip().lower() for u in _setting("MINIDMS_SETUP_USERS").split(",") if u.strip()]
+    me = actor().lower()
+    if listed:
+        return me in listed, "listed in MINIDMS_SETUP_USERS" if me in listed else \
+            "not listed in MINIDMS_SETUP_USERS"
+    if in_sis():
+        owner = str(get_session().sql("SELECT CURRENT_USER()").collect()[0][0]).lower()
+        return me == owner, "you are the app owner" if me == owner else \
+            "only the app owner may run setup in Streamlit in Snowflake"
+    if auth_configured():
+        return False, "shared deployment: set MINIDMS_SETUP_USERS to allow setup"
+    return True, "local run with your own connection"
 
 
 def slug(user: str) -> str:

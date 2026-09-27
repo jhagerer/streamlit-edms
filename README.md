@@ -32,6 +32,7 @@ app_pages/              Streamlit pages
   _ui.py                sidebar, dialogs, document list, metadata widgets
   documents.py upload.py search.py trash.py document.py
   document_types.py metadata_types.py tags.py audit.py admin.py diagnostics.py
+  setup.py              runs the setup SQL step by step from inside the app
 core/                   plain Python (no Streamlit, except core/session.py)
   session.py            Snowpark session (SiS or local), viewer identity, cache decorator
   schema.py             table columns, dtypes, reduction keys, READ_/APPEND_TABLES
@@ -39,6 +40,7 @@ core/                   plain Python (no Streamlit, except core/session.py)
   snapshot.py           parquet snapshots on @sessions
   write.py              row builders, validation, save_to_session(), flush()
   files.py              @doc_files upload, AI_PARSE_DOCUMENT, orphan housekeeping
+  setup.py              setup script parsing, grants, schema status checks
   search.py             SEARCH() / ILIKE over document_text
   model.py              current state: documents, tags, metadata, filters
 sql/                    setup DDL, grants and deployment
@@ -50,11 +52,32 @@ multipage detection does not interfere with `st.navigation`.
 
 ## 1. Set up the schema (once)
 
-In a worksheet, in the database and schema you want to use:
+Two ways — both run the same idempotent statements (nothing is ever dropped):
 
-1. Run [`sql/minidms-setup.sql`](sql/minidms-setup.sql) — 2 stages, 8 tables, 1 view.
-2. Adapt and run [`sql/minidms-grants-and-deploy.sql`](sql/minidms-grants-and-deploy.sql)
-   (privileges, PyPI integration, optional `CREATE STREAMLIT`).
+**A. From the app: System → Setup.** The page works before any MiniDMS object exists
+(when the schema is missing, every other page links to it). It walks through:
+
+1. **Connection** — account, user, role, warehouse, database, schema. On a local run you
+   can switch (or create) database and schema here.
+2. **Stages** — `@doc_files`, `@sessions`
+3. **Tables** — the eight event logs
+4. **Audit view** — `audit_v`
+5. **Grants** (optional) — `SELECT, INSERT` (no `UPDATE`/`DELETE`) for an app role
+6. **PyPI integration** (optional, SiS container runtime; usually ACCOUNTADMIN)
+7. **`CREATE STREAMLIT`** (shown for copying only)
+8. **Starter definitions** (optional) — a few document types, metadata types and tags,
+   added as pending changes you then *Save to database*
+
+Every statement is shown before it runs; each has its own *Run* button, and every step
+has *Run all*. A progress bar shows how many of the 11 objects exist; a log shows
+each result.
+
+Who may run it: on a local run, you. In Streamlit in Snowflake, only the app owner. On a
+shared deployment with login (e.g. Community Cloud), only the users listed in
+`MINIDMS_SETUP_USERS`. Everyone else sees the page read-only.
+
+**B. In a worksheet.** Run [`sql/minidms-setup.sql`](sql/minidms-setup.sql), then adapt
+[`sql/minidms-grants-and-deploy.sql`](sql/minidms-grants-and-deploy.sql).
 
 Note: a role that *owns* the tables can always delete from them. To have the database
 enforce append-only, let a different role own the tables and grant the app role only
@@ -102,9 +125,56 @@ Optional environment variables:
 | `MINIDMS_USER` | Actor name to record (default: `CURRENT_USER()` of your connection) |
 | `MINIDMS_PARSE_MODE` | `OCR` (default) or `LAYOUT` for `AI_PARSE_DOCUMENT` |
 | `MINIDMS_RUNTIME` | Force `local` or `sis` if auto-detection gets it wrong |
+| `MINIDMS_SETUP_USERS` | Comma-separated users allowed to run the Setup page (env or secrets) |
 
 Locally, the person at the screen is the person whose credentials are used, so
 `CURRENT_USER()` is the right actor.
+
+## 2c. Run on Streamlit Community Cloud
+
+The same code runs on [Streamlit Community Cloud](https://share.streamlit.io). It
+connects to Snowflake over the internet like the local version. Two things differ from a
+local run:
+
+- **No browser SSO.** The app needs a Snowflake user that can log in without a person:
+  a *service user with key-pair authentication*.
+- **One Snowflake user for everybody.** So `CURRENT_USER()` cannot tell viewers apart.
+  Turn on Streamlit's login (`[auth]` in the secrets). The app then records the viewer's
+  login e-mail as the actor and gives each viewer their own `@sessions` folder. When
+  `[auth]` is configured, the app asks for a login before it touches Snowflake.
+
+Steps:
+
+1. **Service user** (in Snowflake, as an admin). Create a key pair:
+   ```bash
+   openssl genrsa 2048 | openssl pkcs8 -topk8 -inform PEM -out rsa_key.p8 -nocrypt
+   openssl rsa -in rsa_key.p8 -pubout -out rsa_key.pub
+   ```
+   ```sql
+   CREATE ROLE IF NOT EXISTS MINIDMS_APP;
+   CREATE USER IF NOT EXISTS MINIDMS_SVC TYPE = SERVICE
+     DEFAULT_ROLE = MINIDMS_APP DEFAULT_WAREHOUSE = <wh>
+     RSA_PUBLIC_KEY = '<contents of rsa_key.pub without the BEGIN/END lines>';
+   GRANT ROLE MINIDMS_APP TO USER MINIDMS_SVC;
+   ```
+   Then create the schema objects (worksheet, or the Setup page from a local run) and
+   grant `MINIDMS_APP` its privileges (Setup step 5). If your account uses a network
+   policy, it must allow connections from Community Cloud.
+2. **Login provider.** Create an OpenID Connect client, e.g. in the Google Cloud Console
+   (OAuth client ID, type *Web application*), with the redirect URI
+   `https://<your-app>.streamlit.app/oauth2callback`.
+3. **Deploy.** On [share.streamlit.io](https://share.streamlit.io) → *Create app* → pick
+   the GitHub repository and branch, main file `streamlit_app.py`. Under *Advanced
+   settings* choose Python 3.11 and paste the secrets — template in
+   [`.streamlit/secrets.community-cloud.toml.example`](.streamlit/secrets.community-cloud.toml.example).
+   The private key can be pasted as PEM; the app converts it.
+4. **Check.** Log in, open **Diagnostics**: *Viewer (actor)* must be your e-mail, and
+   `CURRENT_USER()` the service user. Open **Setup**: the progress bar must be full.
+
+Notes: queries, Cortex text extraction and storage are billed to your Snowflake
+account. The cache is shared by all viewers of the app. Community Cloud gives an app
+limited memory, which caps how large the logs can grow before you need the reduced
+view (§9.10).
 
 ## Tests
 
@@ -116,8 +186,10 @@ pytest
 The tests need no Snowflake account. They cover the reduction (`latest()` with its
 tie-break), `view()`/`compose()`, `clean_restored()`, column validation, the parquet
 round trip, save-to-session → restore → flush, the interrupted flush that heals
-itself, the layering rules, and a smoke test that renders every page with Streamlit's
-`AppTest` against an in-memory fake session.
+itself, the layering rules, the setup script parsing and grants, the PEM key
+conversion, the login gate, and smoke tests that render every page (including running
+the setup against an empty schema) with Streamlit's `AppTest` and an in-memory fake
+session.
 
 ## Using it
 

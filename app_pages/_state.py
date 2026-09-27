@@ -192,3 +192,26 @@ def debug_state() -> dict:
         "appends": {t: df.height for t, df in _store().items()},
         "session_state_keys": sorted(str(k) for k in st.session_state.keys()),
     }
+
+
+# ── Setup page log ───────────────────────────────────────────────────────────
+
+_SETUP_LOG = "_setup_log"
+
+
+def setup_log_add(sql: str, ok: bool, message: str) -> None:
+    st.session_state.setdefault(_SETUP_LOG, []).insert(0, (ok, sql, message))
+
+
+def setup_log() -> list[tuple[bool, str, str]]:
+    return st.session_state.get(_SETUP_LOG, [])
+
+
+def try_begin_run() -> str | None:
+    """begin_run() for pages that must also work before the schema exists.
+    Returns the error message, or None on success."""
+    try:
+        begin_run()
+        return None
+    except Exception as exc:
+        return str(exc)

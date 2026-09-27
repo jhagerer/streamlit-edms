@@ -7,6 +7,7 @@ import streamlit as st
 
 from app_pages import _state
 from core import model
+from core.session import auth_configured
 from core.schema import APPEND_TABLES
 
 DOCUMENT_PAGE = "app_pages/document.py"
@@ -25,6 +26,8 @@ def sidebar() -> None:
     counts = _state.pending_counts()
     with st.sidebar:
         st.caption(f"Signed in as **{_state.user()}**")
+        if auth_configured():
+            st.button("Log out", on_click=st.logout)
         total = sum(counts.values())
         if total:
             if _state.unsaved_to_session():

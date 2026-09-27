@@ -109,3 +109,45 @@ def test_document_list_and_detail(fake):
     at.switch_page("app_pages/documents.py").run()
     assert not at.exception, at.exception
     assert not at.dataframe  # nothing left in the active list
+
+
+def test_missing_schema_points_to_setup_and_setup_creates_it(fake):
+    fake.schema_missing = True
+    at = app().run()
+    assert not at.exception, at.exception
+    assert at.error and "Cannot reach the MiniDMS schema" in at.error[0].value
+
+    at.switch_page("app_pages/setup.py").run()
+    assert not at.exception, at.exception
+    assert at.title[0].value == "Setup"
+    click(at.button, "Run all 8 statement(s) of this step")
+    at.run()
+    assert not at.exception, at.exception
+    assert sum(q.startswith("CREATE TABLE") for q in fake.executed) == 8
+
+    at.switch_page("app_pages/documents.py").run()
+    assert not at.exception, at.exception
+    assert at.title[0].value == "Documents"
+
+
+def test_setup_starter_definitions(fake):
+    at = app().run()
+    at.switch_page("app_pages/setup.py").run()
+    click(at.button, "Add starter definitions")
+    at.run()
+    assert not at.exception, at.exception
+    click(at.sidebar.button, "Save to database")
+    at.run()
+    assert len(fake.tables["document_type_log"]) == 4
+    assert len(fake.tables["tag_log"]) == 3
+
+
+def test_login_required_when_auth_is_configured(fake):
+    at = app()
+    at.secrets["auth"] = {"redirect_uri": "http://localhost:8501/oauth2callback",
+                          "cookie_secret": "x", "client_id": "x", "client_secret": "x",
+                          "server_metadata_url": "https://example.com/.well-known/openid-configuration"}
+    at.run()
+    assert not at.exception, at.exception
+    assert [b.label for b in at.button] == ["Log in"]
+    assert not fake.queries  # nothing touches Snowflake before login

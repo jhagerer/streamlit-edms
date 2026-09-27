@@ -73,6 +73,8 @@ class FakeSession:
         self.fail_insert_on: str | None = None
         self.file = _Files(self)
         self.queries: list[str] = []
+        self.schema_missing = False  # simulate a fresh schema without MiniDMS objects
+        self.executed: list[str] = []
 
     def create_dataframe(self, rows, schema=None):
         return _SpDF(self, rows, schema)
@@ -88,6 +90,19 @@ class FakeSession:
     def sql(self, query, params=None):
         self.queries.append(query)
         q = query.strip()
+        if q.startswith(("CREATE", "GRANT", "USE")):
+            self.executed.append(q)
+            if q.startswith("CREATE TABLE"):
+                self.schema_missing = False
+            return _Result([])
+        if "information_schema.tables" in q:
+            if self.schema_missing:
+                return _Result([])
+            return _Result([(t, "BASE TABLE") for t in self.tables] + [("audit_v", "VIEW")])
+        if "information_schema.stages" in q:
+            return _Result([] if self.schema_missing else [("doc_files",), ("sessions",)])
+        if self.schema_missing and ("SYSTEM$" in q or "FROM" in q) and "CURRENT_USER()" not in q:
+            raise RuntimeError("Object does not exist")
         if q.startswith("LIST"):
             prefix = q.split()[1].lstrip("@")
             return _Result([Row(name=k, size=len(v), md5="", last_modified="Mon, 01 Jan 2026 00:00:00 GMT")
@@ -108,7 +123,7 @@ class FakeSession:
         if m:
             return _Result(arrow=self._arrow(m.group(1), ["event_id"]))
         if "CURRENT_USER()" in q:
-            return _Result([("OWNER", "ROLE", "WH", "DB", "SCHEMA")])
+            return _Result([("OWNER", "ROLE", "WH", "DB", "SCHEMA", "ACCT")])
         if q.startswith("SELECT"):
             return _Result([], arrow=None)  # anything else: empty result
         raise NotImplementedError(q)
@@ -116,10 +131,10 @@ class FakeSession:
 
 @pytest.fixture
 def fake(monkeypatch):
-    from core import files, read, search, session, snapshot, write
+    from core import files, read, search, session, setup, snapshot, write
 
     s = FakeSession()
-    for mod in (read, snapshot, write, files, search, session):
+    for mod in (read, snapshot, write, files, search, session, setup):
         monkeypatch.setattr(mod, "get_session", lambda: s)
     monkeypatch.setenv("MINIDMS_USER", "alice")
     monkeypatch.setattr(session, "_mode", "local")
