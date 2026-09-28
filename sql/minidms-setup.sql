@@ -9,9 +9,10 @@
 -- Assumes: database, schema and warehouse exist; the Streamlit app is deployed
 -- via Snowflake Workspaces.
 --
--- Idempotent. Tables, the stream and the task use IF NOT EXISTS so re-running
--- never drops data or resets the stream offset; views and the procedure use
--- OR REPLACE because they hold no state.
+-- Idempotent. Tables and the stream use IF NOT EXISTS so re-running never
+-- drops data or resets the stream offset; views, the procedure and the task
+-- use OR REPLACE because they hold no state (re-running suspends the task
+-- again, and the ALTER TASK … RESUME at the end starts it).
 --
 -- Privileges the owning role needs for the pipeline: CREATE STREAM / TASK /
 -- PROCEDURE on the schema, EXECUTE TASK and EXECUTE MANAGED TASK on the
@@ -205,8 +206,8 @@ QUALIFY ROW_NUMBER() OVER (PARTITION BY file_id ORDER BY event_ts DESC, event_id
 CREATE OR REPLACE PROCEDURE extract_text()
     RETURNS VARCHAR
     LANGUAGE SQL
-    EXECUTE AS OWNER
     COMMENT = 'Extract text for queued files with AI_PARSE_DOCUMENT.'
+    EXECUTE AS OWNER
 AS
 $$
 DECLARE
@@ -296,10 +297,12 @@ END;
 $$;
 
 -- Triggered task: no schedule, runs when the stream has data. Serverless (no
--- WAREHOUSE); to use a warehouse instead, add WAREHOUSE = <wh>.
-CREATE TASK IF NOT EXISTS extract_text_task
-    WHEN SYSTEM$STREAM_HAS_DATA('document_file_log_stream')
+-- WAREHOUSE); TARGET_COMPLETION_INTERVAL tells Snowflake how quickly a run
+-- should finish. To use a warehouse instead, add WAREHOUSE = <wh>.
+CREATE OR REPLACE TASK extract_text_task
     COMMENT = 'Runs extract_text() when new files are saved'
+    TARGET_COMPLETION_INTERVAL = '15 MINUTE'
+    WHEN SYSTEM$STREAM_HAS_DATA('document_file_log_stream')
 AS
     CALL extract_text();
 

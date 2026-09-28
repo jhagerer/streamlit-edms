@@ -37,10 +37,15 @@ def test_pipeline_objects_are_idempotent_and_ordered():
     stmts = setup.setup_statements()
     by = {(s.kind, s.name): s.sql for s in stmts}
     assert "IF NOT EXISTS" in by[("stream", "document_file_log_stream")]  # keeps the offset
-    assert "IF NOT EXISTS" in by[("task", "extract_text_task")]
-    assert "WHEN SYSTEM$STREAM_HAS_DATA('document_file_log_stream')" in by[("task", "extract_text_task")]
-    assert "SCHEDULE" not in by[("task", "extract_text_task")]           # triggered, not scheduled
+    task = by[("task", "extract_text_task")]
+    assert task.startswith("CREATE OR REPLACE TASK extract_text_task")
+    assert "SCHEDULE" not in task                                        # triggered, not scheduled
+    assert "TARGET_COMPLETION_INTERVAL = '15 MINUTE'" in task
+    # Clause order: COMMENT before WHEN (task), COMMENT before EXECUTE AS (procedure).
+    assert task.index("COMMENT") < task.index("TARGET_COMPLETION_INTERVAL") \
+        < task.index("WHEN SYSTEM$STREAM_HAS_DATA('document_file_log_stream')") < task.index("\nAS")
     proc = by[("procedure", "extract_text")]
+    assert proc.index("COMMENT") < proc.index("EXECUTE AS OWNER") < proc.index("\nAS")
     assert "AI_PARSE_DOCUMENT(TO_FILE('@doc_files'" in proc
     assert "FROM document_file_log_stream" in proc
     assert "UPDATE " not in proc and "DELETE " not in proc                # append-only
