@@ -18,10 +18,11 @@ Schema: [`sql/minidms-setup.sql`](sql/minidms-setup.sql)
    and keyed on the table's change token (`SYSTEM$LAST_CHANGE_COMMIT_TIME`).
 2. **All writes are appends.** No `UPDATE`, no `DELETE`. The current state is the latest
    row per key.
-3. **Session state is durable.** Your unsaved changes can be saved as parquet files in
-   `@sessions/<you>/`. They come back automatically the next time you open the app.
-4. **Writing has two stages.** *Save to session* writes to the stage; *Save to database*
-   inserts into the log tables.
+3. **Session state is durable.** Every change is saved automatically, right away, as
+   parquet files in `@sessions/<you>/`. Unsaved work comes back the next time you open
+   the app.
+4. **Writing has two stages.** The automatic save keeps your changes private in
+   `@sessions`; *Save to database* inserts them into the log tables for everyone.
 
 ## Project layout
 
@@ -41,7 +42,7 @@ core/                   plain Python (no Streamlit, except core/session.py)
   schema.py             table columns, dtypes, reduction keys, READ_/APPEND_TABLES
   read.py               change tokens, cached loaders, latest(), view(), restore()
   snapshot.py           parquet snapshots on @sessions
-  write.py              row builders, validation, save_to_session(), flush()
+  write.py              row builders, validation, save_to_session() (automatic), flush()
   files.py              @doc_files upload ({checksum}/{filename}), orphan housekeeping
   ocr.py                extraction task state, recent runs, run on demand
   setup.py              setup script parsing, grants, schema status checks
@@ -258,8 +259,9 @@ session.
   asks Snowflake for full-text matches (`SEARCH()` or substring).
 - **Document** — properties, metadata, tags, files (download, add, remove), extracted
   text, and the full history of the document including unsaved events.
-- The **sidebar** on every page shows your pending changes and the three buttons
-  *Save to session*, *Save to database*, *Discard changes*.
+- The **sidebar** on every page shows your pending changes (saved automatically to your
+  session folder) and the buttons *Save to database* and *Discard changes*. If an
+  automatic save fails, the sidebar says so and it is retried on the next click.
 - **Admin** — your pending rows, everyone's session folders (with cleanup), raw vs.
   current row counts and memory, orphaned-file scan and cleanup, credit usage.
 - **Diagnostics** — actor, `st.user`, tokens, per-table counts and load times, probe
@@ -274,22 +276,23 @@ trail comes for free. "Delete" means *trash* (documents), *deactivate* (types, t
 be restored.
 
 **Where did my unsaved changes go?**
-Changes you have not saved live only in your browser session. After
-*Save to session* they are in `@sessions/<you>/` and come back automatically when you
-open the app again (a dialog tells you). After *Save to database* they are in the
-tables for everyone.
+Every change is written to `@sessions/<you>/` the moment you make it, and comes back
+automatically when you open the app again (a dialog tells you). After
+*Save to database* the changes are in the tables for everyone, and your session folder
+is emptied.
 
 ## Known limits (by design)
 
 - **Last writer wins on the whole record.** Each edit appends a full snapshot. If two
   people edit different fields of the same document, the second save overwrites the
   first.
-- **Several tabs, one user**: all tabs write the same `@sessions/<you>/` folder; the
-  later *Save to session* wins.
-- Unsaved work is only safe after *Save to session*.
+- **Several tabs, one user**: all tabs write the same `@sessions/<you>/` folder; each
+  automatic save overwrites that table's file, so the tab that changed a table last
+  wins for that table.
+- Each change costs one small write to `@sessions` (only the tables that changed).
 - Uploaded bytes stay in `@doc_files` even if you discard — clean them up on **Admin**.
 - A document is searchable only after it is saved *and* the task has extracted its text
-  (usually well under a minute; the Search page says how many are still waiting).
+  (the Search page says how many are still waiting).
 - Files of other types (e.g. `.md`, `.csv`, `.xlsx`) are stored and downloadable but get
   no text (`skipped`).
 - No page viewer — use the extracted text and the download button.

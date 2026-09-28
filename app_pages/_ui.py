@@ -14,9 +14,9 @@ DOCUMENT_PAGE = "app_pages/document.py"
 
 SAVE_COPY = (
     "Files upload immediately; entries are saved when you click "
-    "**Save to database**. Text (OCR) is extracted in Snowflake after that, "
-    "usually within a minute. **Save to session** keeps your unsaved work safe "
-    "if the browser closes."
+    "**Save to database**. Text (OCR) is extracted in Snowflake shortly after that. "
+    "Every change is also saved automatically to your "
+    "session folder, so unsaved work survives a closed browser."
 )
 
 
@@ -32,10 +32,13 @@ def sidebar() -> None:
             st.button("Log out", on_click=st.logout)
         total = sum(counts.values())
         if total:
-            if _state.unsaved_to_session():
-                st.warning(f"{total} unsaved change(s) — not yet saved to session.", icon="⚠️")
+            error = _state.autosave_error()
+            if error:
+                st.warning(f"{total} change(s) — automatic save to your session folder "
+                           f"failed, retrying on the next click: {error}", icon="⚠️")
             else:
-                st.info(f"{total} change(s) saved to session, not yet to database.", icon="💾")
+                st.info(f"{total} change(s) kept in your session (saved automatically), "
+                        "not yet in the database.", icon="💾")
             with st.expander("Pending rows"):
                 for t in APPEND_TABLES:
                     if counts.get(t):
@@ -43,16 +46,7 @@ def sidebar() -> None:
         else:
             st.success("All changes saved.", icon="✅")
 
-        c1, c2 = st.columns(2)
-        if c1.button("Save to session", disabled=not total,
-                     help="Write your unsaved changes to your personal session folder."):
-            try:
-                n = _state.save_to_session()
-                _state.flash(f"Saved {n} table(s) to your session.")
-            except Exception as exc:
-                _state.flash(f"Save to session failed: {exc}", "error")
-            st.rerun()
-        if c2.button("Save to database", type="primary", disabled=not total,
+        if st.button("Save to database", type="primary", disabled=not total,
                      help="Commit your changes for everyone."):
             try:
                 with st.spinner("Saving to database…"):

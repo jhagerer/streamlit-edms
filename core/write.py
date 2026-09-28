@@ -2,7 +2,8 @@
 
 Every write is an append of a full snapshot of the record. Pages build rows
 with the helpers below and hand them to the tier-1 store (pages/_state); the
-store calls ``save_to_session`` and ``flush`` with its frames.
+store calls ``save_to_session`` (automatically, after every change) and
+``flush`` with its frames.
 """
 
 from __future__ import annotations
@@ -110,13 +111,16 @@ def tag_row(actor: str, tag_id: str, label: str, color: str, active: bool = True
 # ── Persisting ───────────────────────────────────────────────────────────────
 
 
-def save_to_session(user: str, appends: dict[str, pl.DataFrame], session=None) -> int:
+def save_to_session(user: str, appends: dict[str, pl.DataFrame], session=None,
+                    tables: tuple[str, ...] | list[str] | None = None) -> int:
     """Tier 1 -> tier 2. A straight serialise: tier 1 already is exactly the set
-    of rows to persist. Returns the number of files written."""
+    of rows to persist. ``tables`` limits the write to the tables that just
+    changed (the app saves automatically after every change). Returns the
+    number of files written."""
     from core import snapshot
 
     written = 0
-    for table in APPEND_TABLES:
+    for table in (tables or APPEND_TABLES):
         mine = appends.get(table)
         if mine is not None and mine.height:
             snapshot.write_snapshot(user, table, mine, session)

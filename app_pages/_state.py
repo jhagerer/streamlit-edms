@@ -19,7 +19,8 @@ _APPENDS = "appends"
 _TOKENS = "_tokens"
 _RESTORED = "_restored"
 _REPORT = "_restore_report"
-_DIRTY = "_dirty"
+_DIRTY = "_dirty"  # the last automatic save to @sessions failed
+_AUTOSAVE_ERROR = "_autosave_error"
 _FLASH = "_flash"
 _SCOPE = "_scope"
 
@@ -41,6 +42,7 @@ def begin_run() -> None:
     st.session_state[_SCOPE] = scope
     if not st.session_state.get(_RESTORED):
         _restore_on_entry()
+    retry_autosave()
 
 
 def current_scope() -> str:
@@ -94,24 +96,49 @@ def set_appends(table: str, df: pl.DataFrame | None) -> None:
 
 
 def add_appends(table: str, rows: list[dict]) -> None:
-    """Validate (loudly) and add rows to tier 1. ``_pending`` is not set here;
-    ``view()`` adds it at render time."""
-    if not rows:
-        return
-    new = write.rows_frame(table, rows)
-    cur = _store().get(table)
-    _store()[table] = new if cur is None else pl.concat([cur, new], how="vertical_relaxed")
-    st.session_state[_DIRTY] = True
+    """Validate (loudly), add rows to tier 1, and save them to tier 2 right
+    away. ``_pending`` is not set here; ``view()`` adds it at render time."""
+    if rows:
+        append_many({table: rows})
 
 
 def append_many(batch: dict[str, list[dict]]) -> None:
-    """Validate everything first, then add — so a bad row adds nothing."""
+    """Validate everything first, then add — so a bad row adds nothing. Then
+    save the changed tables to the session folder automatically."""
     frames = {t: write.rows_frame(t, rows) for t, rows in batch.items() if rows}
     for table, new in frames.items():
         cur = _store().get(table)
         _store()[table] = new if cur is None else pl.concat([cur, new], how="vertical_relaxed")
     if frames:
+        _autosave(list(frames))
+
+
+def _autosave(tables: list[str] | None = None) -> bool:
+    """Tier 1 -> tier 2 for the given tables (all when None). Never raises: a
+    failed save is remembered, shown in the sidebar and retried on the next
+    rerun (with all tables, so nothing is missed)."""
+    try:
+        write.save_to_session(user(), all_appends(), tables=tables)
+        st.session_state[_DIRTY] = False
+        st.session_state.pop(_AUTOSAVE_ERROR, None)
+        return True
+    except Exception as exc:
         st.session_state[_DIRTY] = True
+        st.session_state[_AUTOSAVE_ERROR] = str(exc)
+        return False
+
+
+def retry_autosave() -> None:
+    """Called every rerun: if the last automatic save failed, try again."""
+    if st.session_state.get(_DIRTY) and has_pending():
+        _autosave()
+
+
+def autosave_error() -> str | None:
+    """The error of the last failed automatic save, or None."""
+    if st.session_state.get(_DIRTY) and has_pending():
+        return st.session_state.get(_AUTOSAVE_ERROR, "unknown error")
+    return None
 
 
 def clear_appends() -> None:
@@ -125,11 +152,6 @@ def pending_counts() -> dict[str, int]:
 
 def has_pending() -> bool:
     return bool(pending_counts())
-
-
-def unsaved_to_session() -> bool:
-    """True when tier 1 holds changes not yet written to tier 2."""
-    return bool(st.session_state.get(_DIRTY)) and has_pending()
 
 
 # ── Reading ──────────────────────────────────────────────────────────────────
@@ -150,12 +172,6 @@ def ocr_status() -> pl.DataFrame:
 
 
 # ── Writing ──────────────────────────────────────────────────────────────────
-
-
-def save_to_session() -> int:
-    n = write.save_to_session(user(), all_appends())
-    st.session_state[_DIRTY] = False
-    return n
 
 
 def _prune_committed() -> None:
@@ -207,7 +223,7 @@ def debug_state() -> dict:
     """What tier 1 holds, for the diagnostics page."""
     return {
         "restored": st.session_state.get(_RESTORED, False),
-        "dirty": st.session_state.get(_DIRTY, False),
+        "autosave_failed": st.session_state.get(_DIRTY, False),
         "appends": {t: df.height for t, df in _store().items()},
         "session_state_keys": sorted(str(k) for k in st.session_state.keys()),
     }

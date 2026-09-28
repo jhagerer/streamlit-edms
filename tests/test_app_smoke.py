@@ -36,7 +36,8 @@ def test_create_tag_and_flush(fake):
     at.run()
     assert not at.exception, at.exception
     assert any("Urgent" == t.value for t in at.text_input), [t.value for t in at.text_input]
-    assert any("1 unsaved" in w.value for w in at.sidebar.warning)
+    assert any("1 change(s) kept in your session" in m.value for m in at.sidebar.info)
+    assert "sessions/alice/tag_log.parquet" in fake.stage
 
     click(at.sidebar.button, "Save to database")
     at.run()
@@ -45,23 +46,50 @@ def test_create_tag_and_flush(fake):
     assert at.sidebar.success[0].value == "All changes saved."
 
 
-def test_save_to_session_then_restore_in_new_browser_session(fake):
+def test_every_change_is_saved_to_session_automatically(fake):
     at = app().run()
+    assert not [b for b in at.sidebar.button if b.label == "Save to session"]
     at.switch_page("app_pages/document_types.py").run()
     at.text_input[0].input("Invoice")
     click(at.button, "Add")
     at.run()
-    click(at.sidebar.button, "Save to session")
-    at.run()
     assert not at.exception, at.exception
-    assert any(k.startswith("sessions/alice/") for k in fake.stage)
+    # Saved to @sessions right away — no button — but not to the database.
+    snap = fake.stage.get("sessions/alice/document_type_log.parquet")
+    assert snap is not None
     assert fake.tables["document_type_log"] == []
+    assert any("saved automatically" in m.value for m in at.sidebar.info)
 
     fresh = app().run()  # a new browser session: restore on entry
     assert not fresh.exception, fresh.exception
-    assert any("1 change(s) saved to session" in m.value for m in fresh.sidebar.info)
+    assert any("1 change(s) kept in your session" in m.value for m in fresh.sidebar.info)
     fresh.switch_page("app_pages/document_types.py").run()
     assert any(t.value == "Invoice" for t in fresh.text_input)
+
+
+def test_failed_autosave_is_shown_and_retried(fake, monkeypatch):
+    from core import snapshot
+
+    real = snapshot.write_snapshot
+    calls = {"n": 0}
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("stage unavailable")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(snapshot, "write_snapshot", flaky)
+    at = app().run()
+    at.switch_page("app_pages/tags.py").run()
+    at.text_input[0].input("Urgent")
+    click(at.button, "Add")
+    at.run()
+    assert not at.exception, at.exception
+    # The add reruns the page: the failure is recorded, then retried on that rerun.
+    assert calls["n"] >= 2
+    assert "sessions/alice/tag_log.parquet" in fake.stage
+    assert not at.sidebar.warning
 
 
 def seed(fake):
@@ -250,3 +278,24 @@ def test_admin_text_extraction_tab(fake):
     click(at.button, "Run extraction now")
     at.run()
     assert "EXECUTE TASK extract_text_task" in fake.executed
+
+
+def test_persistent_autosave_failure_warns(fake, monkeypatch):
+    from core import snapshot
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("stage unavailable")
+
+    monkeypatch.setattr(snapshot, "write_snapshot", broken)
+    at = app().run()
+    at.switch_page("app_pages/tags.py").run()
+    at.text_input[0].input("Urgent")
+    click(at.button, "Add")
+    at.run()
+    assert not at.exception, at.exception
+    assert any("automatic save to your session folder failed" in w.value
+               for w in at.sidebar.warning)
+    # The change itself is kept in memory and can still go to the database.
+    click(at.sidebar.button, "Save to database")
+    at.run()
+    assert [r["label"] for r in fake.tables["tag_log"]] == ["Urgent"]
