@@ -11,31 +11,35 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from core.schema import APPEND_TABLES, SYSTEM_TABLES, TOKEN_TABLES
-from core.session import get_session
+from core import db
+from core.schema import HYBRID_TABLES, STANDARD_TABLES, TOKEN_TABLES
 
 SETUP_SQL = Path(__file__).resolve().parents[1] / "sql" / "minidms-setup.sql"
 
 _IDENT = re.compile(r'^(?:[A-Za-z_][A-Za-z0-9_$]*|"[^"]+")$')
 _CREATE = re.compile(
-    r"^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(STAGE|TABLE|VIEW|STREAM|PROCEDURE|TASK)\s+"
-    r"(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_][\w$]*)",
+    r"^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(ADAPTIVE\s+WAREHOUSE|HYBRID\s+TABLE|STAGE|TABLE|VIEW|"
+    r"STREAM|PROCEDURE|TASK)\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_][\w$]*)",
     re.IGNORECASE,
 )
+_SEED = re.compile(r"^\s*INSERT\s+INTO\s+(sync_state)\b", re.IGNORECASE)
+_KIND = {"adaptive warehouse": "warehouse", "hybrid table": "hybrid"}
 _RESUME = re.compile(r"^\s*ALTER\s+TASK\s+([A-Za-z_][\w$]*)\s+RESUME\b", re.IGNORECASE)
 
-STAGES = ("doc_files", "sessions")
-VIEWS = ("audit_v", "ocr_status_v")
-STREAMS = ("document_file_log_stream",)
-PROCEDURES = ("extract_text",)
-TASKS = ("extract_text_task",)
+WAREHOUSES = ("minidms_wh",)
+STAGES = ("doc_files",)
+VIEWS = ("document_text_current", "document_enrichment_current", "ai_status_v", "audit_v")
+STREAMS = ("ai_request_stream",)
+PROCEDURES = ("process_ai",)
+TASKS = ("process_ai_task",)
 
 
 @dataclass
 class Statement:
     sql: str
-    kind: str | None = None      # stage | table | view | stream | procedure | task
-                                 # | resume (ALTER TASK … RESUME) | None
+    kind: str | None = None      # warehouse | stage | hybrid | table | view | stream
+                                 # | procedure | task | resume (ALTER TASK … RESUME)
+                                 # | seed (INSERT INTO sync_state) | None
     name: str | None = None      # object name, lower case
 
 
@@ -106,7 +110,11 @@ def _strip_comments_edges(stmt: str) -> str:
 def classify(sql: str) -> Statement:
     m = _CREATE.match(sql)
     if m:
-        return Statement(sql, m.group(1).lower(), m.group(2).lower())
+        kind = re.sub(r"\s+", " ", m.group(1).lower())
+        return Statement(sql, _KIND.get(kind, kind), m.group(2).lower())
+    m = _SEED.match(sql)
+    if m:
+        return Statement(sql, "seed", m.group(1).lower())
     m = _RESUME.match(sql)
     if m:
         return Statement(sql, "resume", m.group(1).lower())
@@ -127,26 +135,46 @@ def quote(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
-def grant_statements(role: str, database: str, schema: str,
-                     warehouse: str | None = None) -> list[Statement]:
-    """Privileges for the app's role: what it exercises and nothing more — no
-    UPDATE or DELETE. ``database``/``schema`` come from the session context.
+# Hybrid tables people edit: which DML the app needs on each.
+_HYBRID_GRANTS = {
+    "document_type": "SELECT, INSERT, UPDATE",
+    "metadata_type": "SELECT, INSERT, UPDATE",
+    "tag": "SELECT, INSERT, UPDATE",
+    "document": "SELECT, INSERT, UPDATE",
+    "document_file": "SELECT, INSERT, UPDATE",
+    "document_metadata": "SELECT, INSERT, UPDATE, DELETE",
+    "document_tag": "SELECT, INSERT, DELETE",
+    "change_log": "SELECT, INSERT",          # history: append-only, enforced here
+    "sync_state": "SELECT, UPDATE",
+}
+_STANDARD_GRANTS = {
+    "stored_file": "SELECT, INSERT",
+    "ai_request": "SELECT, INSERT",
+    "document_text": "SELECT",              # written only by process_ai()
+    "document_enrichment": "SELECT",
+    "ai_job_log": "SELECT",
+}
 
-    Text extraction runs as the *owner* of the task and procedure, so the
+
+def grant_statements(role: str, database: str, schema: str,
+                     warehouse: str | None = "MINIDMS_WH") -> list[Statement]:
+    """Privileges for the app's role: what it exercises and nothing more.
+    ``database``/``schema`` come from the session context.
+
+    AI processing runs as the *owner* of the task and procedure, so the
     Cortex privilege belongs to the owning role, not here."""
     if not valid_ident(role):
         raise ValueError(f"not a valid role name: {role!r}")
     if warehouse and not valid_ident(warehouse):
         raise ValueError(f"not a valid warehouse name: {warehouse!r}")
-    db, sch = quote(database), f"{quote(database)}.{quote(schema)}"
-    stmts = [f"GRANT USAGE ON DATABASE {db} TO ROLE {role}",
+    dbq, sch = quote(database), f"{quote(database)}.{quote(schema)}"
+    stmts = [f"GRANT USAGE ON DATABASE {dbq} TO ROLE {role}",
              f"GRANT USAGE ON SCHEMA {sch} TO ROLE {role}"]
     if warehouse:
         stmts.append(f"GRANT USAGE ON WAREHOUSE {warehouse} TO ROLE {role}")
     stmts += [f"GRANT READ, WRITE ON STAGE {sch}.{s} TO ROLE {role}" for s in STAGES]
-    stmts += [f"GRANT SELECT, INSERT ON TABLE {sch}.{t} TO ROLE {role}" for t in APPEND_TABLES]
-    # Written only by the extraction task; the app just reads them.
-    stmts += [f"GRANT SELECT ON TABLE {sch}.{t} TO ROLE {role}" for t in SYSTEM_TABLES]
+    stmts += [f"GRANT {p} ON TABLE {sch}.{t} TO ROLE {role}" for t, p in _HYBRID_GRANTS.items()]
+    stmts += [f"GRANT {p} ON TABLE {sch}.{t} TO ROLE {role}" for t, p in _STANDARD_GRANTS.items()]
     stmts += [f"GRANT SELECT ON VIEW {sch}.{v} TO ROLE {role}" for v in VIEWS]
     # Lets the Admin page show the task and start a run on demand.
     stmts += [f"GRANT MONITOR, OPERATE ON TASK {sch}.{t} TO ROLE {role}" for t in TASKS]
@@ -173,7 +201,7 @@ def create_streamlit_sql(name: str, source: str, warehouse: str, pool: str) -> s
         f"CREATE STREAMLIT {name}\n"
         f"  FROM '{source}'\n"
         "  MAIN_FILE = 'streamlit_app.py'\n"
-        f"  QUERY_WAREHOUSE = {warehouse}\n"
+        f"  QUERY_WAREHOUSE = {warehouse}  -- the adaptive warehouse\n"
         "  RUNTIME_NAME = 'SYSTEM$ST_CONTAINER_RUNTIME_PY3_11'\n"
         f"  COMPUTE_POOL = {pool}\n"
         "  EXTERNAL_ACCESS_INTEGRATIONS = (pypi_eai)\n"
@@ -187,27 +215,36 @@ def steps(text: str | None = None) -> list[Step]:
     by_kind = lambda *k: [s for s in stmts if s.kind in k]  # noqa: E731
     other = [s for s in stmts if s.kind is None]
     out = [
-        Step("stages", "Stages",
-             "`@doc_files` holds uploaded files at `{checksum}/{filename}` (with a "
-             "directory table and server-side encryption, which AI_PARSE_DOCUMENT needs). "
-             "`@sessions` holds per-user parquet snapshots of unsaved work.",
+        Step("warehouse", "Adaptive warehouse",
+             "`minidms_wh` is the only warehouse MiniDMS uses — for the app's queries and for "
+             "the AI task. Adaptive: Snowflake sizes it per query. Needs CREATE WAREHOUSE.",
+             by_kind("warehouse")),
+        Step("stage", "Stage",
+             "`@doc_files` holds uploaded files at `{checksum}/{filename}` (with a directory "
+             "table and server-side encryption, which AI_COMPLETE needs to read them).",
              by_kind("stage")),
-        Step("tables", "Tables",
-             "Seven append-only event logs written by the app, plus `document_text` and "
-             "`ocr_log`, written by the text-extraction task. `IF NOT EXISTS` — re-running "
-             "never drops data.",
+        Step("hybrid", "Hybrid tables (what people edit)",
+             "Documents, metadata values, tags, file attachments and the definitions: current "
+             "state with enforced primary keys and a version column per row, so concurrent "
+             "edits are detected instead of overwritten. `change_log` keeps the history "
+             "(its event_id primary key makes every action idempotent); `sync_state` holds the "
+             "change counters the app uses as cache keys. The last statement fills it.",
+             by_kind("hybrid", "seed")),
+        Step("standard", "Standard tables (files and AI output)",
+             "Uploaded files, AI requests, OCR text and enrichments: append-only and written "
+             "by INSERT … SELECT inside Snowflake, so they carry column-level lineage.",
              by_kind("table")),
         Step("views", "Views",
-             "`audit_v` unions all logs; `ocr_status_v` is the latest extraction status per "
-             "file. `OR REPLACE` is safe — views hold no data.",
-             [s for s in by_kind("view")]),
-        Step("pipeline", "Text extraction (stream + triggered task)",
-             "A stream on `document_file_log` sees files as soon as they are saved to the "
-             "database; the triggered task then calls `extract_text()`, which runs "
-             "AI_PARSE_DOCUMENT in Snowflake and appends to `document_text` and `ocr_log`. "
-             "The owning role needs CREATE STREAM/TASK/PROCEDURE, EXECUTE TASK, EXECUTE "
-             "MANAGED TASK (serverless) and SNOWFLAKE.CORTEX_USER. The last statement "
-             "resumes the task (tasks are created suspended).",
+             "Latest OCR text and enrichment per file, AI state per file, and the audit trail. "
+             "`OR REPLACE` is safe — views hold no data.",
+             by_kind("view")),
+        Step("pipeline", "AI pipeline (stream + triggered task)",
+             "A stream on `ai_request` fires the triggered task on `minidms_wh` right after a "
+             "file is uploaded; it calls `process_ai()`, which runs AI_COMPLETE "
+             "(claude-sonnet-4-5) for OCR, summary, type and tag suggestions and metadata "
+             "extraction. The owning role needs CREATE STREAM/TASK/PROCEDURE, EXECUTE TASK, "
+             "USAGE on the warehouse and SNOWFLAKE.CORTEX_USER. The last statement resumes the "
+             "task (tasks are created suspended).",
              by_kind("stream", "procedure", "task", "resume")),
     ]
     if other:
@@ -220,21 +257,20 @@ def steps(text: str | None = None) -> list[Step]:
 
 
 def context(session=None) -> dict[str, str | None]:
-    session = session or get_session()
-    r = session.sql(
+    r = db.query(
         "SELECT CURRENT_USER(), CURRENT_ROLE(), CURRENT_WAREHOUSE(), "
-        "CURRENT_DATABASE(), CURRENT_SCHEMA(), CURRENT_ACCOUNT()"
-    ).collect()[0]
+        "CURRENT_DATABASE(), CURRENT_SCHEMA(), CURRENT_ACCOUNT()", session=session
+    )[0]
     keys = ("user", "role", "warehouse", "database", "schema", "account")
     return dict(zip(keys, r))
 
 
-def _show_names(session, what: str) -> dict[str, dict]:
-    """SHOW <what> IN SCHEMA (current schema) -> {lower name: row dict}."""
+def _show(session, what: str) -> dict[str, dict] | None:
+    """SHOW <what> -> {lower name: row dict}; None if the command failed."""
     try:
-        rows = session.sql(f"SHOW {what} IN SCHEMA").collect()
+        rows = db.query(f"SHOW {what}", session=session)
     except Exception:
-        return {}
+        return None
     out = {}
     for r in rows:
         d = {k.lower().strip('"'): v for k, v in r.as_dict().items()}
@@ -244,36 +280,52 @@ def _show_names(session, what: str) -> dict[str, dict]:
 
 
 def existing_objects(session=None) -> dict[str, set[str]]:
-    """Stages, tables, views, streams, procedures and tasks in the current
-    schema (names lower case). ``resume`` holds the tasks that are started."""
-    session = session or get_session()
-    tables = session.sql(
+    """What exists in the current schema (names lower case), keyed like the
+    statement kinds. ``warehouse`` only lists adaptive warehouses; ``resume``
+    the started tasks; ``seed`` contains sync_state once all counters exist."""
+    tables = db.query(
         "SELECT LOWER(table_name), table_type FROM information_schema.tables "
-        "WHERE table_schema = CURRENT_SCHEMA()"
-    ).collect()
-    stages = session.sql(
+        "WHERE table_schema = CURRENT_SCHEMA()", session=session)
+    stages = db.query(
         "SELECT LOWER(stage_name) FROM information_schema.stages "
-        "WHERE stage_schema = CURRENT_SCHEMA()"
-    ).collect()
-    procedures = session.sql(
+        "WHERE stage_schema = CURRENT_SCHEMA()", session=session)
+    procedures = db.query(
         "SELECT LOWER(procedure_name) FROM information_schema.procedures "
-        "WHERE procedure_schema = CURRENT_SCHEMA()"
-    ).collect()
-    tasks = _show_names(session, "TASKS")
+        "WHERE procedure_schema = CURRENT_SCHEMA()", session=session)
+    table_names = {r[0] for r in tables if r[1] in ("BASE TABLE", "HYBRID TABLE")}
+    hybrid = _show(session, "HYBRID TABLES IN SCHEMA")
+    tasks = _show(session, "TASKS IN SCHEMA") or {}
+    warehouses = _show(session, "WAREHOUSES LIKE 'MINIDMS_WH'") or {}
+    seeded: set[str] = set()
+    if "sync_state" in table_names:
+        try:
+            have = {str(r[0]).lower() for r in db.query("SELECT table_name FROM sync_state",
+                                                         session=session)}
+            if set(TOKEN_TABLES) <= have:
+                seeded = {"sync_state"}
+        except Exception:
+            pass
     return {
-        "table": {r[0] for r in tables if r[1] == "BASE TABLE"},
+        "warehouse": {n for n, d in warehouses.items()
+                      if str(d.get("type", "")).upper() == "ADAPTIVE"},
+        "hybrid": set(hybrid) if hybrid is not None else table_names & set(HYBRID_TABLES),
+        "table": table_names,
         "view": {r[0] for r in tables if r[1] == "VIEW"},
         "stage": {r[0] for r in stages},
         "procedure": {r[0] for r in procedures},
-        "stream": set(_show_names(session, "STREAMS")),
+        "stream": set(_show(session, "STREAMS IN SCHEMA") or {}),
         "task": set(tasks),
         "resume": {n for n, d in tasks.items() if str(d.get("state", "")).lower() == "started"},
+        "seed": seeded,
     }
 
 
 NEEDED = {
+    "warehouse": WAREHOUSES,
     "stage": STAGES,
-    "table": TOKEN_TABLES,
+    "hybrid": HYBRID_TABLES,
+    "seed": ("sync_state",),
+    "table": STANDARD_TABLES,
     "view": VIEWS,
     "stream": STREAMS,
     "procedure": PROCEDURES,
@@ -298,12 +350,10 @@ def use(kind: str, name: str, create: bool = False, session=None) -> None:
         raise ValueError(kind)
     if not valid_ident(name):
         raise ValueError(f"not a valid name: {name!r}")
-    session = session or get_session()
     if create and kind != "WAREHOUSE":
-        session.sql(f"CREATE {kind} IF NOT EXISTS {name}").collect()
-    session.sql(f"USE {kind} {name}").collect()
+        db.query(f"CREATE {kind} IF NOT EXISTS {name}", session=session)
+    db.query(f"USE {kind} {name}", session=session)
 
 
 def run(sql: str, session=None) -> list:
-    session = session or get_session()
-    return session.sql(sql).collect()
+    return db.query(sql, session=session)

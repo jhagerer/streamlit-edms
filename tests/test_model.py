@@ -2,88 +2,92 @@ from datetime import datetime, timedelta
 
 import polars as pl
 
-from core import model, read, schema, write
+from core import model, schema
 
 T = datetime(2026, 1, 1)
 
 
-def fr(table, rows):
-    return read.compose(write.rows_frame(table, rows), None)
+def frame(table, rows):
+    return schema.conform(table, pl.DataFrame(rows, infer_schema_length=None))
 
 
-def stamp(row, seconds):
-    row["event_ts"] = T + timedelta(seconds=seconds)
-    return row
+def audit(i=0):
+    return {"created_at": T + timedelta(seconds=i), "created_by": "alice",
+            "updated_at": T + timedelta(seconds=i), "updated_by": "alice"}
+
+
+def ai_status(rows):
+    return frame("ai_status_v", rows)
+
+
+def test_files_view_ai_states():
+    links = frame("document_file", [
+        {"file_id": f, "document_id": "d1", "active": a, "version": 1, **audit(i)}
+        for i, (f, a) in enumerate([("new", True), ("q", True), ("ok", True), ("bad", True),
+                                    ("skip", True), ("gone", False)])
+    ])
+    stored = frame("stored_file", [{"file_id": f, "document_id": "d1", "filename": f"{f}.pdf",
+                                    "stage_path": f"@doc_files/x/{f}.pdf"}
+                                   for f in ("new", "q", "ok", "bad", "skip", "gone")])
+    status = ai_status([
+        {"file_id": "q", "requested_at": T, "pending": True},
+        {"file_id": "ok", "requested_at": T, "text_status": "done", "enrich_status": "done",
+         "pending": False},
+        {"file_id": "bad", "requested_at": T, "text_status": "done", "enrich_status": "failed",
+         "pending": False},
+        {"file_id": "skip", "requested_at": T, "text_status": "skipped",
+         "enrich_status": "skipped", "pending": False},
+    ])
+    out = model.files_view(links, stored, status)
+    assert dict(zip(out["file_id"], out["ai_state"])) == {
+        "new": "missing", "q": "queued", "ok": "done", "bad": "failed", "skip": "skipped"}
+    assert "gone" in model.files_view(links, stored, status, include_inactive=True)["file_id"]
 
 
 def test_document_table_joins_and_filters():
-    u = "alice"
-    docs = fr("document_log", [
-        stamp(write.document_row(u, "create", "d1", "t1", "Invoice 42", None, None), 0),
-        stamp(write.document_row(u, "create", "d2", None, "Letter", None, None), 1),
-        stamp(write.document_row(u, "trash", "d2", None, "Letter", None, None), 2),
+    docs = frame("document", [
+        {"document_id": "d1", "label": "Invoice 42", "document_type_id": "t1", "status": "active",
+         "version": 3, **audit(1)},
+        {"document_id": "d2", "label": "Letter", "status": "trashed", "version": 2, **audit(2)},
     ])
-    types = fr("document_type_log", [write.document_type_row(u, "t1", "Invoice")])
-    files = fr("document_file_log", [write.file_row(u, document_id="d1", file_id="f1", filename="scan.pdf",
-                                                    stage_path="p", mimetype=None, size=1, checksum=None,
-                                                    page_count=1)])
-    meta = fr("metadata_log", [stamp(write.metadata_row(u, "d1", "m1", "ACME"), 0),
-                               stamp(write.metadata_row(u, "d1", "m2", "x"), 0),
-                               stamp(write.metadata_row(u, "d1", "m2", ""), 1)])
-    links = fr("tag_assignment_log", [stamp(write.tag_assignment_row(u, "d1", "red", True), 0),
-                                      stamp(write.tag_assignment_row(u, "d1", "blue", True), 0),
-                                      stamp(write.tag_assignment_row(u, "d1", "blue", False), 1)])
-    tags = fr("tag_log", [write.tag_row(u, "red", "Red", "#f00"), write.tag_row(u, "blue", "Blue", "#00f")])
-    appended = write.rows_frame("tag_assignment_log", [write.tag_assignment_row(u, "d1", "blue", True)])
-    links = pl.concat([links, read.compose(schema.empty("tag_assignment_log"), appended)], how="vertical_relaxed")
-
-    table = model.document_table(docs, types, files, meta, links, tags)
+    types = frame("document_type", [{"document_type_id": "t1", "label": "Invoice", "active": True,
+                                     "version": 1, **audit()}])
+    files = pl.DataFrame({"document_id": ["d1"], "filename": ["scan.pdf"], "ai_state": ["queued"]})
+    meta = frame("document_metadata", [{"document_id": "d1", "metadata_type_id": "m1",
+                                        "value": "ACME", "version": 1}])
+    doc_tags = frame("document_tag", [{"document_id": "d1", "tag_id": "red"},
+                                      {"document_id": "d1", "tag_id": "old"}])
+    tags = frame("tag", [{"tag_id": "red", "label": "Red", "active": True, "version": 1, **audit()},
+                         {"tag_id": "old", "label": "Old", "active": False, "version": 2, **audit()}])
+    enrich = frame("document_enrichment_current", [
+        {"event_id": "e1", "created_at": T, "file_id": "f1", "document_id": "d1", "status": "done",
+         "summary": "Invoice from ACME for 42 EUR"}])
+    table = model.document_table(docs, types, files, meta, doc_tags, tags, enrich)
     d1 = table.filter(pl.col("document_id") == "d1").row(0, named=True)
-    assert d1["document_type"] == "Invoice"
-    assert sorted(d1["tags"]) == ["Blue", "Red"]
-    assert d1["files"] == 1 and d1["pending"] is True
-    assert d1["metadata_text"] == "ACME"
-
-    active = model.filter_documents(table)
-    assert active["document_id"].to_list() == ["d1"]
+    assert d1["document_type"] == "Invoice" and d1["tags"] == ["Red"]   # inactive tag hidden
+    assert d1["files"] == 1 and d1["ai_state"] == "queued" and d1["version"] == 3
+    assert d1["summary"].startswith("Invoice from ACME")
+    assert model.filter_documents(table)["document_id"].to_list() == ["d1"]
     assert model.filter_documents(table, trashed=True)["document_id"].to_list() == ["d2"]
-    assert model.filter_documents(table, text="acme").height == 1
+    assert model.filter_documents(table, text="42 eur").height == 1     # matches the summary
     assert model.filter_documents(table, text="scan.pdf").height == 1
-    assert model.filter_documents(table, tag_ids=["red", "blue"]).height == 1
-    assert model.filter_documents(table, document_type_ids=["nope"]).height == 0
+    assert model.filter_documents(table, tag_ids=["red"]).height == 1
     assert model.filter_documents(table, ids=[]).height == 0
 
 
-def test_definitions_hide_inactive():
-    u = "alice"
-    log = fr("tag_log", [stamp(write.tag_row(u, "t", "Old", "#000"), 0),
-                         stamp(write.tag_row(u, "t", "Old", "#000", active=False), 1)])
-    assert model.definitions(log, "tag_log").height == 0
-    assert model.definitions(log, "tag_log", include_inactive=True).height == 1
-
-
-def test_file_text_status():
-    u = "alice"
-    f_rows = [write.file_row(u, document_id="d", file_id=fid, filename=f"{fid}.pdf", stage_path="p",
-                             mimetype=None, size=1, checksum=None, page_count=None)
-              for fid in ("new", "wait", "q", "ok", "bad", "retried")]
-    for r in f_rows:
-        r["event_ts"] = T + timedelta(seconds=10)
-    committed = write.rows_frame("document_file_log", f_rows[1:])
-    pending = write.rows_frame("document_file_log", [f_rows[0]])
-    files = model.current_files(read.compose(committed, pending))
-    # "retried": failed at t=5, resubmitted (file row) at t=10 -> waiting again
-    ocr = pl.DataFrame(
-        [("q", "queued", 11, None), ("ok", "done", 12, 3), ("bad", "failed", 12, None),
-         ("retried", "failed", 5, None)],
-        schema={"file_id": pl.Utf8, "status": pl.Utf8, "s": pl.Int64, "page_count": pl.Int64},
-        orient="row",
-    ).with_columns(
-        (pl.lit(T) + pl.duration(seconds=pl.col("s"))).cast(pl.Datetime("us")).alias("event_ts"),
-        pl.lit("boom").alias("message"),
-    )
-    out = model.file_text_status(files, ocr)
-    got = dict(zip(out["file_id"], out["text_status"]))
-    assert got == {"new": "unsaved", "wait": "waiting", "q": "queued", "ok": "done",
-                   "bad": "failed", "retried": "waiting"}
-    assert out.filter(pl.col("file_id") == "ok")["ocr_pages"][0] == 3
+def test_suggestions_only_valid_and_different():
+    enr = {"status": "done", "suggested_type_id": "t2",
+           "suggested_tag_ids": '["red", "ghost", "blue"]',
+           "extracted_metadata": '[{"metadata_type_id": "amount", "value": "42"},'
+                                 ' {"metadata_type_id": "status", "value": "maybe"},'
+                                 ' {"metadata_type_id": "date", "value": "2026-01-05"},'
+                                 ' {"metadata_type_id": "unknown", "value": "x"}]'}
+    mts = {"amount": {"data_type": "number", "active": True},
+           "status": {"data_type": "choice", "choices": "open\ndone", "active": True},
+           "date": {"data_type": "date", "active": True}}
+    s = model.suggestions(enr, {"document_type_id": "t1"}, ["blue"], {"date": "2026-01-05"},
+                          {"t1", "t2"}, {"red", "blue"}, mts)
+    assert s == {"document_type_id": "t2", "tag_ids": ["red"], "metadata": {"amount": "42"}}
+    assert model.has_suggestions(s)
+    none = model.suggestions({"status": "failed"}, {}, [], {}, set(), set(), {})
+    assert not model.has_suggestions(none)

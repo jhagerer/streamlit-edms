@@ -51,35 +51,39 @@ if submitted:
             with st.spinner(f"Uploading {up.name} ({i}/{len(uploaded)})"):
                 doc_id = write.new_id()
                 try:
-                    file_row = files.store_upload(up.getvalue(), up.name, up.type, doc_id, user)
+                    stored = files.stage_upload(up.getvalue(), up.name, up.type, doc_id)
                 except Exception as exc:
                     failed.append(f"{up.name}: upload failed — {exc}")
                     progress.progress(i / len(uploaded))
                     continue
-            _state.append_many({
-                "document_log": [write.document_row(
-                    user, "create", doc_id, type_id,
-                    os.path.splitext(up.name)[0], description or None, language or None,
-                )],
-                "document_file_log": [file_row],
-                "metadata_log": [write.metadata_row(user, doc_id, mt_id, v)
-                                 for mt_id, v in values.items() if v],
-                "tag_assignment_log": [write.tag_assignment_row(user, doc_id, t, True)
-                                       for t in tag_ids],
-            })
-            created += 1
-            if not files.extractable(up.name):
+                # 1. The document (hybrid tables, one transaction) …
+                ok = _state.act(
+                    write.create_document, user, document_id=doc_id,
+                    fields={"document_type_id": type_id, "label": os.path.splitext(up.name)[0],
+                            "description": description or None, "language": language or None},
+                    files=[stored], metadata=values, tag_ids=tag_ids,
+                )
+                # 2. … then the file facts + AI request (standard tables): the stream
+                #    on ai_request starts OCR and enrichment in Snowflake.
+                if ok:
+                    try:
+                        write.register_files(user, [stored])
+                    except Exception as exc:
+                        failed.append(f"{up.name}: saved, but AI processing was not requested "
+                                      f"— use “Process again” on the document. ({exc})")
+                    created += 1
+            if ok and not files.extractable(up.name):
                 _state.flash(f"{up.name}: no text extraction for this file type — the "
                              "document is stored, but its content is not searchable.", "info")
             progress.progress(i / len(uploaded))
         for msg in failed:
             _state.flash(msg, "error")
         if created:
-            _state.flash(f"{created} document(s) added — pending until you click "
-                         "**Save to database**.")
-        st.rerun()  # refresh the list and the sidebar counts
+            _state.flash(f"{created} document(s) saved. Snowflake is now extracting text and "
+                         "enriching them with AI_COMPLETE.")
+        st.rerun()
 
-pending_docs = _ui.document_table().filter(pl.col("pending") & ~pl.col("trashed"))
-if pending_docs.height:
-    st.subheader("Unsaved documents")
-    _ui.document_list(pending_docs, "upload:pending")
+recent = _state.document_table().filter(~pl.col("trashed")).sort("created_at", descending=True)
+if recent.height:
+    st.subheader("Recently added")
+    _ui.document_list(recent.head(10), "upload:recent")

@@ -35,26 +35,30 @@ def test_orphans_respects_references_and_age():
     assert out["relative_path"].to_list() == ["b/2.pdf"]
 
 
-def test_store_upload_stages_content_addressed_without_ocr(fake):
-    row = files.store_upload(b"%PDF-1.7 hello", "Invoice 42.pdf", "application/pdf", "doc1", "alice")
+def test_stage_upload_is_content_addressed_and_writes_no_rows(fake):
+    row = files.stage_upload(b"%PDF-1.7 hello", "Invoice 42.pdf", "application/pdf", "doc1")
     checksum = files.sha256_hex(b"%PDF-1.7 hello")
-    assert row["checksum"] == checksum and row["size"] == 14
+    assert row["checksum"] == checksum and row["size"] == 14 and row["document_id"] == "doc1"
     assert row["stage_path"] == f"@doc_files/{checksum}/Invoice_42.pdf"
-    assert row["filename"] == "Invoice 42.pdf"          # original name kept in the log
+    assert row["filename"] == "Invoice 42.pdf"          # original name kept for stored_file
     assert fake.stage[f"doc_files/{checksum}/Invoice_42.pdf"] == b"%PDF-1.7 hello"
-    assert not any("AI_PARSE_DOCUMENT" in q for q in fake.queries)  # OCR runs in Snowflake
+    assert fake.count("stored_file") == 0               # rows come with the document write
+    assert not any("AI_COMPLETE" in q for q in fake.queries)   # AI runs inside Snowflake
 
 
 def test_same_content_same_name_is_stored_once(fake):
-    r1 = files.store_upload(b"same", "a.txt", None, "d1", "alice")
-    r2 = files.store_upload(b"same", "a.txt", None, "d2", "bob")
+    r1 = files.stage_upload(b"same", "a.txt", None, "d1")
+    r2 = files.stage_upload(b"same", "a.txt", None, "d2")
     assert r1["stage_path"] == r2["stage_path"] and r1["file_id"] != r2["file_id"]
     assert len([k for k in fake.stage if k.startswith("doc_files/")]) == 1
 
 
-def test_resubmit_row_is_identical_snapshot():
-    f = {"document_id": "d", "file_id": "f", "filename": "a.pdf", "stage_path": "p",
-         "mimetype": "application/pdf", "size": 1, "checksum": SHA, "page_count": None,
-         "event_id": "old"}
-    again = files.resubmit_row(f, "bob")
-    assert again["file_id"] == "f" and again["active"] is True and again["event_id"] != "old"
+def test_ai_extensions_match_the_procedure():
+    """The app's list and the regex in process_ai() must agree."""
+    import re
+
+    from core import setup
+
+    proc = [s.sql for s in setup.setup_statements() if s.kind == "procedure"][0]
+    exts = re.search(r"\[\.\]\(([a-z|]+)\)\$", proc).group(1).split("|")
+    assert {f".{e}" for e in exts} == files.AI_EXTENSIONS

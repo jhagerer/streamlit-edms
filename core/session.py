@@ -223,8 +223,8 @@ def _st_user_name() -> str | None:
 
 
 def actor() -> str:
-    """Name of the person looking at the screen. Used for the actor column and
-    for the @sessions/{user}/ folder."""
+    """Name of the person looking at the screen. Recorded as the actor of
+    every change (change_log, created_by/updated_by, uploads)."""
     if in_sis():
         # Never fall back to CURRENT_USER() in SiS: it is the app owner.
         name = _st_user_name() or os.environ.get("MINIDMS_USER")

@@ -1,82 +1,62 @@
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import polars as pl
 
-from core import read, schema, write
-
-T0 = datetime(2026, 1, 1, 12, 0, 0)
-
-
-def doc(event_id, ts, op="create", document_id="d1", label="x"):
-    return {"event_id": event_id, "event_ts": ts, "actor": "alice", "op": op,
-            "document_id": document_id, "document_type_id": None, "label": label,
-            "description": None, "language": None}
+from core import read, schema, search, write
+from conftest import stored
 
 
-def frame(rows):
-    return write.rows_frame("document_log", rows)
+def test_tokens_carry_scope_and_move_with_writes(fake):
+    t1 = read.change_tokens()
+    assert set(t1) == set(schema.TOKEN_TABLES)
+    assert all(v.startswith("ACCT/ROLE/DB/SCHEMA|") for v in t1.values())
+    write.create_definition("tag", "alice", {"label": "Red"})
+    t2 = read.change_tokens()
+    assert t2["tag"] != t1["tag"] and t2["change_log"] != t1["change_log"]
+    assert t2["document"] == t1["document"]               # untouched tables keep their key
 
 
-def test_latest_takes_last_event_per_key():
-    log = frame([doc("a", T0, label="one"), doc("b", T0 + timedelta(seconds=1), "update", label="two"),
-                 doc("c", T0, document_id="d2", label="other")])
-    cur = read.latest(log, ["document_id"])
-    assert dict(zip(cur["document_id"], cur["label"])) == {"d1": "two", "d2": "other"}
+def test_load_pins_dtypes_and_is_keyed_on_tokens(fake):
+    write.create_definition("tag", "alice", {"label": "Red"})
+    tokens = read.change_tokens()
+    df = read.load("tag", read.token_for("tag", tokens))
+    assert df.schema == schema.polars_schema("tag")
+    assert isinstance(df["created_at"][0], datetime) and df["active"][0] is True
+    write.create_definition("tag", "alice", {"label": "Blue"})
+    assert read.load("tag", read.token_for("tag", tokens)).height == 1   # same key: cached
+    assert read.load("tag", read.token_for("tag", read.change_tokens())).height == 2
 
 
-def test_latest_tie_break_on_event_id_is_deterministic():
-    rows = [doc("b", T0, "update", label="B"), doc("a", T0, label="A")]
-    for order in (rows, rows[::-1]):
-        cur = read.latest(frame(order), ["document_id"])
-        assert cur["label"].to_list() == ["B"]  # 'b' > 'a'
+def test_views_and_history(fake):
+    write.create_document("alice", document_id="d1", fields={"label": "X"},
+                          files=[stored()], metadata={}, tag_ids=[])
+    write.register_files("alice", [stored()])
+    tokens = read.change_tokens()
+    status = read.load("ai_status_v", read.token_for("ai_status_v", tokens))
+    assert status["pending"].to_list() == [True]
+    hist = read.load_history("d1", tokens["change_log"])
+    assert hist["entity"].to_list() == ["document", "document_file"]
 
 
-def test_trash_then_restore_ordering():
-    log = frame([doc("1", T0), doc("2", T0 + timedelta(seconds=1), "trash"),
-                 doc("3", T0 + timedelta(seconds=2), "restore")])
-    assert read.latest(log, ["document_id"])["op"].to_list() == ["restore"]
+def test_search_covers_text_and_summary(fake):
+    write.create_document("alice", document_id="d1", fields={"label": "X"},
+                          files=[stored()], metadata={}, tag_ids=[])
+    write.register_files("alice", [stored()])
+    fake.conn.execute("INSERT INTO document_text (event_id, extracted_at, actor, file_id, status, "
+                      "content) VALUES ('t1', '2026-01-01 00:00:00.000000', 'system:ai', 'f1', "
+                      "'done', 'Rechnung über 42 EUR')")
+    fake.conn.execute("INSERT INTO document_enrichment (event_id, created_at, actor, file_id, "
+                      "document_id, status, summary) VALUES ('e1', '2026-01-01 00:00:01.000000', "
+                      "'system:ai', 'f1', 'd1', 'done', 'An invoice from ACME')")
+    assert search.search_ids("Rechnung") == ["d1"]
+    assert search.search_ids("ACME", "ILIKE") == ["d1"]
+    assert search.search_ids("nothing") == []
+    assert search.search_ids("") == []
 
 
-def test_idempotent_double_flush_reduces_to_one_record():
-    row = doc("same", T0)
-    log = frame([row, row])
-    assert read.latest(log, ["document_id"]).height == 1
-
-
-def test_compose_marks_exactly_appended_rows_pending():
-    committed = frame([doc("a", T0)])
-    appended = frame([doc("b", T0, "update")])
-    out = read.compose(committed, appended)
-    assert out.height == 2
-    assert out.filter(pl.col("_pending"))["event_id"].to_list() == ["b"]
-
-
-def test_compose_with_empty_appends_is_committed_frame():
-    committed = frame([doc("a", T0)])
-    out = read.compose(committed, schema.empty("document_log"))
-    assert out.drop("_pending").equals(committed)
-    assert not out["_pending"].any()
-
-
-def test_clean_restored():
-    snap = frame([doc("a", T0), doc("b", T0)])
-    committed = frame([doc("a", T0)])
-    assert read.clean_restored(snap, committed)["event_id"].to_list() == ["b"]
-    assert read.clean_restored(None, committed) is None
-    assert read.clean_restored(schema.empty("document_log"), committed) is None
-    assert read.clean_restored(snap, schema.empty("document_log")).height == 2
-    # Result never contains committed rows.
-    assert read.clean_restored(snap, snap).height == 0
-
-
-def test_conform_pins_dtypes_and_order():
-    raw = pl.DataFrame({"LABEL": ["x"], "EVENT_ID": ["e"], "DOCUMENT_ID": ["d"],
-                        "EVENT_TS": [T0], "ACTOR": ["a"], "OP": ["create"], "EXTRA": [1]})
-    out = schema.conform("document_log", raw)
-    assert out.columns == schema.columns("document_log")
-    assert out.schema["event_ts"] == pl.Datetime("us")
-    assert out["description"].to_list() == [None]
-
-
-def test_conform_empty_arrow_result():
-    assert schema.conform("tag_log", pl.DataFrame()).height == 0
+def test_conform_empty_and_strings():
+    assert schema.conform("tag", pl.DataFrame()).height == 0
+    df = schema.conform("document", pl.DataFrame({"DOCUMENT_ID": ["d"], "VERSION": [1],
+                                                  "CREATED_AT": ["2026-01-01 10:00:00.000000"]}))
+    assert df.columns == schema.columns("document")
+    assert df["created_at"][0] == datetime(2026, 1, 1, 10)

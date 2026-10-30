@@ -39,7 +39,7 @@ pages = {
 page = st.navigation(pages)
 
 # Shared hosted deployment (e.g. Community Cloud): require a login so every
-# viewer has their own identity and their own @sessions folder.
+# viewer has their own identity.
 if auth_configured() and not is_logged_in():
     st.title("MiniDMS")
     st.write("Please log in to continue.")
@@ -47,14 +47,14 @@ if auth_configured() and not is_logged_in():
     st.stop()
 
 if page.url_path == setup_page.url_path:
-    # The Setup page must work before the schema exists.
+    # The Setup page must work before the schema (or the warehouse) exists.
     if _state.try_begin_run() is None:
         _ui.sidebar()
     _ui.show_notices()
     page.run()
     st.stop()
 
-error = _state.try_begin_run()  # one token probe per rerun + restore on entry
+error = _state.try_begin_run()  # one point query: all change counters
 if error:
     st.error(f"Cannot reach the MiniDMS schema in Snowflake: {error}")
     st.info(
@@ -63,6 +63,9 @@ if error:
         "(outside Streamlit in Snowflake) and create the objects step by step."
     )
     st.page_link(setup_page, label="Open the Setup page", icon="⚙️")
+    st.stop()
+
+if not _ui.warehouse_gate():  # only adaptive warehouses
     st.stop()
 
 _ui.sidebar()

@@ -198,32 +198,25 @@ def connection_step() -> dict | None:
     else:
         st.warning(f"Not connected to Snowflake. Enter credentials below. ({error})")
 
-    locked = _state.has_pending()
-    if locked:
-        st.warning("You have unsaved changes. Save them to the database (or discard them) "
-                   "before you change the connection — they belong to the current "
-                   "account and schema.", icon="⚠️")
-    else:
-        b1, b2, _ = st.columns([1, 1, 2])
-        if source == "own" and b1.button(
-                "Disconnect", help="Forget the credentials entered here and fall back to "
-                                   "the app's shared connection, if any."):
-            disconnect_own()
-            _state.flash("Disconnected.", "info")
-            st.rerun()
-        if source == "shared" and b2.button(
-                "Reconnect shared connection",
-                help="Re-read the secrets, e.g. after you changed them."):
-            reconnect_shared()
-            st.rerun()
+    b1, b2, _ = st.columns([1, 1, 2])
+    if source == "own" and b1.button(
+            "Disconnect", help="Forget the credentials entered here and fall back to "
+                               "the app's shared connection, if any."):
+        disconnect_own()
+        _state.flash("Disconnected.", "info")
+        st.rerun()
+    if source == "shared" and b2.button(
+            "Reconnect shared connection",
+            help="Re-read the secrets, e.g. after you changed them."):
+        reconnect_shared()
+        st.rerun()
 
     pre = _prefill()
-    if not locked:
-        with st.expander("Enter or change Snowflake credentials", expanded=ctx is None):
-            st.caption("Used for **this browser session only**: kept in the app server's "
-                       "memory, never written to disk, gone when you close the tab. Other "
-                       "viewers are not affected.")
-            _credentials_form(pre, have_previous=own_settings() is not None)
+    with st.expander("Enter or change Snowflake credentials", expanded=ctx is None):
+        st.caption("Used for **this browser session only**: kept in the app server's "
+                   "memory, never written to disk, gone when you close the tab. Other "
+                   "viewers are not affected.")
+        _credentials_form(pre, have_previous=own_settings() is not None)
     with st.expander("Generate a key pair"):
         _key_pair_helper(pre, connected=ctx is not None)
     with st.expander("Save the connection permanently (secrets.toml)"):

@@ -7,7 +7,7 @@ all schema statements are idempotent (IF NOT EXISTS / OR REPLACE on the view).
 import streamlit as st
 
 from app_pages import _connection, _state
-from core import setup, write
+from core import read, setup, write
 from core.session import auth_configured, connection_source, in_sis, setup_allowed
 
 st.title("Setup")
@@ -59,7 +59,7 @@ if can_switch:
         c1, c2, c3 = st.columns(3)
         db = c1.text_input("Database", value=ctx["database"] or "")
         sch = c2.text_input("Schema", value=ctx["schema"] or "MINIDMS")
-        wh = c3.text_input("Warehouse", value=ctx["warehouse"] or "")
+        wh = c3.text_input("Warehouse (adaptive)", value="MINIDMS_WH")
         create = st.checkbox("Create database/schema if missing", value=False)
         if st.button("Apply"):
             try:
@@ -78,8 +78,25 @@ if not ctx["database"] or not ctx["schema"]:
     st.error("No current database/schema. Choose one above (local) or set it in the "
              "connection settings.")
     st.stop()
-if not ctx["warehouse"]:
-    st.warning("No current warehouse — statements that need compute will fail.")
+try:
+    wh_name, wh_type = read.warehouse_type()
+except Exception:
+    wh_name, wh_type = ctx["warehouse"], None
+if (wh_type or "").upper() != "ADAPTIVE":
+    current_wh = f"`{wh_name}` ({wh_type or 'unknown type'})" if wh_name else "not set"
+    st.warning(f"The current warehouse is {current_wh}. "
+               "MiniDMS runs only on an adaptive warehouse: create `minidms_wh` in the first "
+               "step below, then use it (above, or as the connection's / Streamlit app's "
+               "warehouse). Creating objects needs no warehouse; the documents pages are "
+               "blocked until it is adaptive.", icon="⚠️")
+    if can_switch and "minidms_wh" in setup.existing_objects().get("warehouse", set()) \
+            and st.button("Use minidms_wh now"):
+        try:
+            setup.use("WAREHOUSE", "MINIDMS_WH")
+            _state.flash("Now using minidms_wh.")
+        except Exception as exc:
+            _state.flash(f"Could not switch: {exc}", "error")
+        st.rerun()
 
 # ── Status ───────────────────────────────────────────────────────────────────
 
@@ -167,27 +184,30 @@ st.code(setup.create_streamlit_sql("minidms", src, qwh, pool), language="sql")
 # ── Starter data (optional) ──────────────────────────────────────────
 
 st.header(f"{n + 3} · Starter definitions (optional)")
-st.caption("Adds a few document types, metadata types and tags as normal pending "
-           "changes. Click **Save to database** in the sidebar to keep them.")
+st.caption("Adds a few document types, metadata types and tags, so AI_COMPLETE has something "
+           "to suggest from.")
+STARTER = {
+    "document_type": [{"label": x} for x in ("Invoice", "Contract", "Letter", "Report")],
+    "metadata_type": [
+        {"name": "date", "label": "Date", "data_type": "date"},
+        {"name": "amount", "label": "Amount", "data_type": "number"},
+        {"name": "counterparty", "label": "Counterparty", "data_type": "text"},
+        {"name": "status", "label": "Status", "data_type": "choice",
+         "choices": "open\nin progress\ndone", "default_value": "open"},
+    ],
+    "tag": [{"label": x, "color": c} for x, c in
+            (("Important", "#d62728"), ("To review", "#ff7f0e"), ("Archived", "#7f7f7f"))],
+}
 if n_missing:
     st.info("Available once the schema is complete.")
 elif st.button("Add starter definitions", disabled=not allowed):
     user = _state.user()
-    _state.append_many({
-        "document_type_log": [write.document_type_row(user, write.new_id(), label)
-                              for label in ("Invoice", "Contract", "Letter", "Report")],
-        "metadata_type_log": [
-            write.metadata_type_row(user, write.new_id(), "date", "Date", "date", None, None),
-            write.metadata_type_row(user, write.new_id(), "amount", "Amount", "number", None, None),
-            write.metadata_type_row(user, write.new_id(), "counterparty", "Counterparty",
-                                    "text", None, None),
-            write.metadata_type_row(user, write.new_id(), "status", "Status", "choice",
-                                    "open\nin progress\ndone", "open"),
-        ],
-        "tag_log": [write.tag_row(user, write.new_id(), label, color) for label, color in
-                    (("Important", "#d62728"), ("To review", "#ff7f0e"), ("Archived", "#7f7f7f"))],
-    })
-    _state.flash("Starter definitions added — pending until you save to the database.")
+    n_added = 0
+    for table, items in STARTER.items():
+        for values in items:
+            n_added += _state.act(write.create_definition, table, user, values)
+    if n_added:
+        _state.flash(f"{n_added} starter definition(s) added.")
     st.rerun()
 
 if not n_missing:

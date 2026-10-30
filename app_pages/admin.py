@@ -2,126 +2,86 @@ import polars as pl
 import streamlit as st
 
 from app_pages import _state, _ui
-from core import files, ocr, read, snapshot, write
-from core.schema import KEYS, READ_TABLES
-from core.session import slug
+from core import ai, db, files, write
+from core.schema import LOADED
 
 st.title("Admin")
 
-tab_pending, tab_snap, tab_ocr, tab_counts, tab_orphans, tab_cost = st.tabs(
-    ["My pending changes", "Session snapshots", "Text extraction", "Log sizes",
-     "Orphaned files", "Cost"]
+tab_ai, tab_counts, tab_orphans, tab_cost = st.tabs(
+    ["AI processing", "Table sizes", "Orphaned files", "Cost"]
 )
 
-with tab_pending:
-    counts = _state.pending_counts()
-    if not counts:
-        st.success("You have no pending changes.")
-    for table, n in counts.items():
-        with st.expander(f"`{table}` — {n} row(s)"):
-            st.dataframe(_state.appends(table), hide_index=True)
-
-with tab_snap:
-    st.caption("Per-user folders on `@sessions` holding un-flushed work. A user's folder is "
-               "removed when they save to the database or discard.")
-    snaps = snapshot.list_snapshots()
-    if not snaps.height:
-        st.info("No session snapshots.")
-    else:
-        now = write.now_utc()
-        folders = (
-            snaps.group_by("folder")
-            .agg(pl.len().alias("files"), pl.col("size").sum().alias("bytes"),
-                 pl.col("last_modified").max().alias("last_modified"),
-                 pl.col("table").sort().alias("tables"))
-            .with_columns(((pl.lit(now) - pl.col("last_modified")).dt.total_hours() / 24)
-                          .round(1).alias("age_days"))
-            .sort("last_modified", descending=True)
-        )
-        st.dataframe(folders, hide_index=True)
-        me = slug(_state.user())
-        days = st.number_input("Remove other users' folders older than (days)", 1, 3650, 30)
-        stale = folders.filter((pl.col("age_days") > days) & (pl.col("folder") != me))
-        st.write(f"{stale.height} folder(s) would be removed. **Their unsaved work is lost.**")
-        if stale.height and st.button("Remove stale snapshot folders", type="primary"):
-            for folder in stale["folder"].to_list():
-                snapshot.remove_folder(folder)
-            st.success(f"Removed {stale.height} folder(s).")
-
-with tab_ocr:
-    st.caption("Saving files to the database feeds the stream `document_file_log_stream`; "
-               "the triggered task `extract_text_task` then runs `extract_text()`, which "
-               "calls AI_PARSE_DOCUMENT in Snowflake.")
+with tab_ai:
+    st.caption("Uploads append to `ai_request`; the stream `ai_request_stream` fires the "
+               "triggered task `process_ai_task` on the adaptive warehouse, which runs "
+               f"`process_ai()`: OCR and enrichment with AI_COMPLETE ({ai.MODEL}).")
     try:
-        task = ocr.task_state()
+        task = ai.task_state()
     except Exception as exc:
         task = None
         st.error(f"Could not read the task: {exc}")
     if task is None:
-        st.warning("The extraction task does not exist or is not visible to this role. "
-                   "Run the *Text extraction* step on the Setup page.")
+        st.warning("The AI task does not exist or is not visible to this role. "
+                   "Run the *AI pipeline* step on the Setup page.")
     else:
         state = str(task.get("state", "?"))
         (st.success if state.lower() == "started" else st.warning)(
-            f"Task `{ocr.TASK}` is **{state}**."
+            f"Task `{ai.TASK}` is **{state}** (warehouse `{task.get('warehouse', '?')}`)."
             + ("" if state.lower() == "started" else
                " New files are not processed until it is resumed (Setup page).")
         )
-    status = _state.ocr_status()
-    counts = ocr.status_counts(status)
-    waiting = _ui.file_status().filter(pl.col("text_status") == "waiting").height
+    all_files = _state.files()
+    counts = ai.state_counts(all_files)
     cols = st.columns(5)
-    for col, key in zip(cols, ("queued", "done", "failed", "skipped")):
+    for col, key in zip(cols, ("queued", "done", "failed", "skipped", "missing")):
         col.metric(key.capitalize(), counts.get(key, 0))
-    cols[4].metric("Waiting", waiting, help="Saved files without a status yet.")
-    failed = status.filter(pl.col("status") == "failed")
+    failed = all_files.filter(pl.col("ai_state") == "failed")
     if failed.height:
-        st.markdown("**Failed files** (retry from the document's *Text* tab)")
-        st.dataframe(failed.select("event_ts", "file_id", "stage_path", "message"),
-                     hide_index=True)
-    c1, c2 = st.columns(2)
-    if c1.button("Run extraction now", help="EXECUTE TASK — normally not needed, the task "
-                                           "fires by itself when files are saved."):
+        st.markdown("**Failed files** (retry with *Process again* on the document)")
+        st.dataframe(failed.select("filename", "document_id", "text_error", "enrich_error",
+                                   "enriched_at"), hide_index=True)
+    missing = ai.files_needing_ai(all_files)
+    c1, c2, c3 = st.columns(3)
+    if c1.button(f"Process {len(missing)} unprocessed file(s)", disabled=not missing,
+                 help="Files attached without an AI request (e.g. an interrupted upload)."):
+        _state.act(write.request_ai, _state.user(), missing, "missing",
+                   success="AI processing requested.")
+        st.rerun()
+    if c2.button("Run the task now", help="EXECUTE TASK — normally not needed, the task "
+                                          "fires by itself when files are uploaded."):
         try:
-            ocr.run_now()
-            st.success("Task started. Results appear here when it finishes.")
+            ai.run_now()
+            st.success("Task started. Results appear when it finishes.")
         except Exception as exc:
             st.error(f"Could not start the task: {exc}")
-    if c2.button("Show recent task runs"):
+    if c3.button("Show recent task runs"):
         try:
-            st.dataframe(ocr.recent_runs(), hide_index=True)
+            st.dataframe(ai.recent_runs(), hide_index=True)
         except Exception as exc:
             st.error(f"Could not read the task history: {exc}")
 
 with tab_counts:
-    st.caption("Raw events vs. current records. Memory grows with raw rows; once the logs "
-               "reach a few hundred MB, switch the loaders to a server-side reduced view "
-               "(architecture §9.10).")
-    tokens = _state.tokens()
+    st.caption("The tables the app loads and caches (shared by all viewers). Hybrid tables "
+               "hold current state, one row per entity, so they grow with the number of "
+               "documents, not with the number of edits.")
     rows = []
-    for t in READ_TABLES:
-        df = read.load_log(t, tokens[t])
-        rows.append({"table": t, "raw_rows": df.height,
-                     "current_records": read.latest(df, KEYS[t]).height,
+    for name in LOADED:
+        df = _state.table(name)
+        rows.append({"table": name, "rows": df.height,
                      "in_memory_mb": round(df.estimated_size("mb"), 2)})
     sizes = pl.DataFrame(rows)
     st.dataframe(sizes, hide_index=True)
     st.metric("Total in-memory (shared across viewers)", f"{sizes['in_memory_mb'].sum():.1f} MB")
 
 with tab_orphans:
-    st.caption("Files are staged at upload; their log rows wait for *Save to database*. "
-               "Discarded uploads leave orphaned bytes. Files referenced by any log row or "
-               "by any user's session snapshot are kept, and so is anything younger than the "
-               "minimum age (someone may be mid-upload).")
+    st.caption("Files are staged first, then recorded in `stored_file`. An interrupted upload "
+               "leaves orphaned bytes. Files referenced by `stored_file` are kept, and so is "
+               "anything younger than the minimum age (someone may be mid-upload).")
     min_age = st.number_input("Minimum age (days)", 0, 3650, 2)
 
     def scan_orphans() -> tuple[pl.DataFrame, pl.DataFrame]:
         staged = files.staged_files()
-        referenced = set(_state.view("document_file_log")["stage_path"].drop_nulls().to_list())
-        for folder in snapshot.list_snapshots()["folder"].unique().to_list():
-            snap = snapshot.read_snapshot(folder, "document_file_log")
-            if snap is not None and "stage_path" in snap.columns:
-                referenced |= set(snap["stage_path"].drop_nulls().to_list())
+        referenced = set(_state.table("stored_file")["stage_path"].drop_nulls().to_list())
         return staged, files.orphans(staged, referenced, int(min_age))
 
     c1, c2 = st.columns(2)
@@ -144,7 +104,7 @@ with tab_cost:
     days = st.number_input("Days", 1, 365, 30, key="cost:days")
     if st.button("Load credit usage"):
         try:
-            df = read.query_frame(
+            df = db.query_frame(
                 "SELECT service_type, name, SUM(credits_used) AS credits "
                 "FROM SNOWFLAKE.ACCOUNT_USAGE.METERING_HISTORY "
                 "WHERE start_time >= DATEADD('day', ?, CURRENT_TIMESTAMP()) "

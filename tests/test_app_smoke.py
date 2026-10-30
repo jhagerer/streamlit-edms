@@ -1,25 +1,23 @@
-"""Render every page against the fake session. Catches errors in page code
+"""Drive the real pages with Streamlit's AppTest against the SQLite-backed
+fake session. Catches errors in page code and checks the user-facing flows
 without a Snowflake account."""
+
+from datetime import datetime
 
 import pytest
 from streamlit.testing.v1 import AppTest
 
+from conftest import stored
+from core import write
+
 PAGES = {"documents": "Documents", "upload": "Upload", "search": "Search", "trash": "Trash",
          "document": "Document", "document_types": "Document types",
          "metadata_types": "Metadata types", "tags": "Tags", "audit": "Audit trail",
-         "admin": "Admin", "diagnostics": "Diagnostics"}
+         "admin": "Admin", "diagnostics": "Diagnostics", "setup": "Setup"}
 
 
 def app():
     return AppTest.from_file("../streamlit_app.py", default_timeout=30)
-
-
-@pytest.mark.parametrize("page", PAGES)
-def test_page_renders(fake, page):
-    at = app().run()
-    at.switch_page(f"app_pages/{page}.py").run()
-    assert not at.exception, at.exception
-    assert at.title[0].value == PAGES[page]
 
 
 def click(buttons, label):
@@ -28,92 +26,64 @@ def click(buttons, label):
     matches[0].click()
 
 
-def test_create_tag_and_flush(fake):
-    at = app().run()
-    at.switch_page("app_pages/tags.py").run()
-    at.text_input[0].input("Urgent")
-    click(at.button, "Add")
-    at.run()
-    assert not at.exception, at.exception
-    assert any("Urgent" == t.value for t in at.text_input), [t.value for t in at.text_input]
-    assert any("1 change(s) kept in your session" in m.value for m in at.sidebar.info)
-    assert "sessions/alice/tag_log.parquet" in fake.stage
-
-    click(at.sidebar.button, "Save to database")
-    at.run()
-    assert not at.exception, at.exception
-    assert [r["label"] for r in fake.tables["tag_log"]] == ["Urgent"]
-    assert at.sidebar.success[0].value == "All changes saved."
-
-
-def test_every_change_is_saved_to_session_automatically(fake):
-    at = app().run()
-    assert not [b for b in at.sidebar.button if b.label == "Save to session"]
-    at.switch_page("app_pages/document_types.py").run()
-    at.text_input[0].input("Invoice")
-    click(at.button, "Add")
-    at.run()
-    assert not at.exception, at.exception
-    # Saved to @sessions right away — no button — but not to the database.
-    snap = fake.stage.get("sessions/alice/document_type_log.parquet")
-    assert snap is not None
-    assert fake.tables["document_type_log"] == []
-    assert any("saved automatically" in m.value for m in at.sidebar.info)
-
-    fresh = app().run()  # a new browser session: restore on entry
-    assert not fresh.exception, fresh.exception
-    assert any("1 change(s) kept in your session" in m.value for m in fresh.sidebar.info)
-    fresh.switch_page("app_pages/document_types.py").run()
-    assert any(t.value == "Invoice" for t in fresh.text_input)
-
-
-def test_failed_autosave_is_shown_and_retried(fake, monkeypatch):
-    from core import snapshot
-
-    real = snapshot.write_snapshot
-    calls = {"n": 0}
-
-    def flaky(*args, **kwargs):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            raise RuntimeError("stage unavailable")
-        return real(*args, **kwargs)
-
-    monkeypatch.setattr(snapshot, "write_snapshot", flaky)
-    at = app().run()
-    at.switch_page("app_pages/tags.py").run()
-    at.text_input[0].input("Urgent")
-    click(at.button, "Add")
-    at.run()
-    assert not at.exception, at.exception
-    # The add reruns the page: the failure is recorded, then retried on that rerun.
-    assert calls["n"] >= 2
-    assert "sessions/alice/tag_log.parquet" in fake.stage
-    assert not at.sidebar.warning
-
-
 def seed(fake):
-    from core import write
+    """A document with one processed file, an enrichment with suggestions, and
+    definitions — written through the real write commands."""
+    write.create_definition("document_type", "bob", {"label": "Invoice"}, entity_id="t1")
+    write.create_definition("document_type", "bob", {"label": "Contract"}, entity_id="t2")
+    write.create_definition("metadata_type", "bob", {"name": "amount", "label": "Amount",
+                                                     "data_type": "number"}, entity_id="m1")
+    write.create_definition("tag", "bob", {"label": "Red", "color": "#ff0000"}, entity_id="red")
+    write.create_definition("tag", "bob", {"label": "Blue", "color": "#0000ff"}, entity_id="blue")
+    write.create_document("bob", document_id="d1",
+                          fields={"label": "Invoice 42", "document_type_id": "t1",
+                                  "description": "desc", "language": "en"},
+                          files=[stored(name="a.txt")], metadata={"m1": "12.5"},
+                          tag_ids=["red"])
+    write.register_files("bob", [stored(name="a.txt")])
+    fake.stage[stored(name="a.txt")["stage_path"].lstrip("@")] = b"hello"
+    # What process_ai() would have written inside Snowflake:
+    fake.conn.execute(
+        "INSERT INTO document_text (event_id, extracted_at, actor, file_id, model, status, content) "
+        "VALUES ('t1', '2020-01-02 00:00:00.000000', 'system:ai', 'f1', 'claude-sonnet-4-5', "
+        "'done', 'Invoice no. 42, total 99 EUR')")
+    fake.conn.execute(
+        "INSERT INTO document_enrichment (event_id, created_at, actor, file_id, document_id, model, "
+        "status, summary, suggested_type_id, suggested_tag_ids, extracted_metadata) VALUES "
+        "('enr1', '2020-01-02 00:00:01.000000', 'system:ai', 'f1', 'd1', 'claude-sonnet-4-5', "
+        "'done', 'An invoice over 99 EUR.', 't2', '[\"blue\"]', "
+        "'[{\"metadata_type_id\": \"m1\", \"value\": \"99\"}]')")
+    # The request is older than the results: the file is processed, not pending.
+    fake.conn.execute("UPDATE ai_request SET requested_at = '2020-01-01 00:00:00.000000'")
+    fake.conn.execute("UPDATE sync_state SET seq = seq + 1 "
+                      "WHERE table_name IN ('ai_request', 'document_text', 'document_enrichment')")
 
-    u = "bob"
-    rows = {
-        "document_type_log": [write.document_type_row(u, "t1", "Invoice")],
-        "document_log": [write.document_row(u, "create", "d1", "t1", "Invoice 42", "desc", "en")],
-        "document_file_log": [write.file_row(u, document_id="d1", file_id="f1", filename="a.txt",
-                                             stage_path="@doc_files/d1/f1.txt", mimetype="text/plain",
-                                             size=5, checksum="x", page_count=None)],
-        "metadata_type_log": [write.metadata_type_row(u, "m1", "amount", "Amount", "number", None, None)],
-        "metadata_log": [write.metadata_row(u, "d1", "m1", "12.5")],
-        "tag_log": [write.tag_row(u, "red", "Red", "#ff0000")],
-        "tag_assignment_log": [write.tag_assignment_row(u, "d1", "red", True)],
-    }
-    for table, rs in rows.items():
-        fake.tables[table].extend(rs)
-        fake.commits[table] = 1
-    fake.stage["doc_files/d1/f1.txt"] = b"hello"
+
+@pytest.mark.parametrize("page", PAGES)
+def test_page_renders(fake, page):
+    seed(fake)
+    at = app().run()
+    at.switch_page(f"app_pages/{page}.py").run()
+    assert not at.exception, at.exception
+    assert at.title[0].value == PAGES[page]
 
 
-def test_document_list_and_detail(fake):
+def test_no_save_buttons_every_change_is_written_immediately(fake):
+    at = app().run()
+    assert not [b for b in at.sidebar.button if "Save" in b.label or "Discard" in b.label]
+    at.switch_page("app_pages/tags.py").run()
+    at.text_input[0].input("Urgent")
+    click(at.button, "Add")
+    at.run()
+    assert not at.exception, at.exception
+    assert [r["label"] for r in fake.rows("SELECT label FROM tag")] == ["Urgent"]
+    assert fake.rows("SELECT entity, op, actor FROM change_log") == [
+        {"entity": "tag", "op": "create", "actor": "alice"}]
+    assert any(t.value == "Urgent" for t in at.text_input)          # cache reloaded
+    assert not any(k.startswith("sessions/") for k in fake.stage)  # no session snapshots
+
+
+def test_document_list_and_trash_restore(fake):
     seed(fake)
     at = app().run()
     assert not at.exception, at.exception
@@ -124,19 +94,83 @@ def test_document_list_and_detail(fake):
     at.run()
     assert not at.exception, at.exception
     assert at.title[0].value == "Invoice 42"
-
+    assert any("An invoice over 99 EUR." in i.value for i in at.info)   # AI summary shown
     click(at.button, "Move to trash")
     at.run()
     assert not at.exception, at.exception
     assert at.title[0].value.startswith("🗑️")
-    click(at.sidebar.button, "Save to database")
+    assert fake.rows("SELECT status, version FROM document") == [{"status": "trashed", "version": 2}]
+    click(at.button, "Restore")
     at.run()
-    assert [r["op"] for r in fake.tables["document_log"]] == ["create", "trash"]
-    assert [r["actor"] for r in fake.tables["document_log"]] == ["bob", "alice"]
+    assert fake.rows("SELECT status, version FROM document") == [{"status": "active", "version": 3}]
 
-    at.switch_page("app_pages/documents.py").run()
+
+def test_concurrent_edit_shows_conflict_and_writes_nothing(fake):
+    seed(fake)
+    at = app()
+    at.query_params["doc"] = "d1"
+    at.switch_page("app_pages/document.py").run()
+    # Someone else trashes the document after this page was rendered.
+    write.update_document("bob", fake.rows("SELECT * FROM document")[0], {"label": "Bob's"})
+    click(at.button, "Move to trash")
+    at.run()
     assert not at.exception, at.exception
-    assert not at.dataframe  # nothing left in the active list
+    assert any("changed by someone else" in e.value for e in at.error)
+    assert fake.rows("SELECT label, status, version FROM document") == [
+        {"label": "Bob's", "status": "active", "version": 2}]
+    assert at.title[0].value == "Bob's"                    # the page now shows the latest
+
+
+def test_ai_suggestions_apply_with_provenance(fake):
+    seed(fake)
+    at = app()
+    at.query_params["doc"] = "d1"
+    at.switch_page("app_pages/document.py").run()
+    assert not at.exception, at.exception
+    apply_buttons = [b for b in at.button if b.label == "Apply"]
+    assert len(apply_buttons) == 3                         # type, tags, amount
+    apply_buttons[2].click()                               # metadata: amount = 99
+    at.run()
+    assert not at.exception, at.exception
+    assert fake.rows("SELECT value, version, updated_by FROM document_metadata") == [
+        {"value": "99", "version": 2, "updated_by": "alice"}]
+    data = fake.rows("SELECT data FROM change_log WHERE entity = 'document_metadata' "
+                     "ORDER BY event_ts DESC LIMIT 1")[0]["data"]
+    assert '"source": "ai:enr1"' in data
+    assert len([b for b in at.button if b.label == "Apply"]) == 2
+
+
+def test_process_again_requests_ai_in_snowflake(fake):
+    seed(fake)
+    at = app()
+    at.query_params["doc"] = "d1"
+    at.switch_page("app_pages/document.py").run()
+    before = fake.count("ai_request")
+    click(at.button, "Process again")
+    at.run()
+    assert not at.exception, at.exception
+    assert fake.count("ai_request") == before + 1
+    assert not any("AI_COMPLETE" in q for q in fake.queries)   # the app never calls Cortex
+    assert any("AI is processing 1 file" in i.value for i in at.sidebar.info)
+
+
+def test_search_uses_text_and_summary(fake):
+    seed(fake)
+    at = app().run()
+    at.switch_page("app_pages/search.py").run()
+    at.text_input(key="search:q").input("EUR").run()
+    assert not at.exception, at.exception
+    assert at.dataframe[0].value["label"].tolist() == ["Invoice 42"]
+
+
+def test_warehouse_gate_blocks_non_adaptive(fake):
+    fake.warehouse_type = "STANDARD"
+    at = app().run()
+    assert not at.exception, at.exception
+    assert any("not adaptive" in e.value for e in at.error)
+    assert not at.title                                     # the page did not render
+    at.switch_page("app_pages/setup.py").run()              # setup still works
+    assert at.title[0].value == "Setup"
 
 
 def test_missing_schema_points_to_setup_and_setup_creates_it(fake):
@@ -148,10 +182,11 @@ def test_missing_schema_points_to_setup_and_setup_creates_it(fake):
     at.switch_page("app_pages/setup.py").run()
     assert not at.exception, at.exception
     assert at.title[0].value == "Setup"
-    click(at.button, "Run all 9 statement(s) of this step")
+    click(at.button, "Run all 10 statement(s) of this step")    # hybrid tables + seed
     at.run()
     assert not at.exception, at.exception
-    assert sum(q.startswith("CREATE TABLE") for q in fake.executed) == 9
+    assert sum(q.startswith("CREATE HYBRID TABLE") for q in fake.executed) == 9
+    assert any("FROM VALUES" in q for q in fake.executed)        # sync_state seed
 
     at.switch_page("app_pages/documents.py").run()
     assert not at.exception, at.exception
@@ -164,10 +199,26 @@ def test_setup_starter_definitions(fake):
     click(at.button, "Add starter definitions")
     at.run()
     assert not at.exception, at.exception
-    click(at.sidebar.button, "Save to database")
+    assert fake.count("document_type") == 4 and fake.count("tag") == 3
+    assert fake.count("metadata_type") == 4
+
+
+def test_admin_ai_tab(fake):
+    seed(fake)
+    write.create_document("alice", document_id="d2", fields={"label": "Orphan"},
+                          files=[stored(file_id="f2", document_id="d2")], metadata={}, tag_ids=[])
+    fake.task_state = "suspended"
+    at = app().run()
+    at.switch_page("app_pages/admin.py").run()
+    assert not at.exception, at.exception
+    assert any("suspended" in w.value for w in at.warning)
+    click(at.button, "Process 1 unprocessed file(s)")
     at.run()
-    assert len(fake.tables["document_type_log"]) == 4
-    assert len(fake.tables["tag_log"]) == 3
+    assert fake.rows("SELECT file_id, reason FROM ai_request WHERE file_id = 'f2'") == [
+        {"file_id": "f2", "reason": "missing"}]
+    click(at.button, "Run the task now")
+    at.run()
+    assert "EXECUTE TASK process_ai_task" in fake.executed
 
 
 def test_login_required_when_auth_is_configured(fake):
@@ -216,7 +267,6 @@ def test_enter_own_credentials_when_not_connected(fake, monkeypatch):
     assert opened["settings"].token == "tok" and opened["settings"].schema == "MINIDMS"
     assert any("Connected as BOB" in s.value for s in at.success)
 
-    # The rest of the app now runs on the viewer's own connection.
     at.switch_page("app_pages/documents.py").run()
     assert not at.exception, at.exception
     assert at.title[0].value == "Documents"
@@ -231,71 +281,43 @@ def test_enter_own_credentials_when_not_connected(fake, monkeypatch):
     assert "Cannot reach the MiniDMS schema" in at.error[0].value
 
 
-def test_connection_change_blocked_with_pending_changes(fake):
-    at = app().run()
-    at.switch_page("app_pages/tags.py").run()
-    at.text_input[0].input("Urgent")
-    click(at.button, "Add")
-    at.run()
-    at.switch_page("app_pages/setup.py").run()
-    assert not at.exception, at.exception
-    assert any("before you change the connection" in w.value for w in at.warning)
-    assert not [b for b in at.button if b.label == "Connect for this browser session"]
-
-
-def test_text_tab_shows_task_status_and_retry_goes_through_the_stream(fake):
-    from datetime import datetime
-
+def test_history_shows_human_and_ai_events(fake):
     seed(fake)
-    fake.tables["ocr_log"].append({
-        "event_id": "o1", "event_ts": datetime(2099, 1, 1), "actor": "system:ocr",
-        "file_id": "f1", "stage_path": "@doc_files/d1/f1.txt", "status": "failed",
-        "page_count": None, "message": "unsupported"})
-    fake.commits["ocr_log"] = 1
+    write.update_document("carol", fake.rows("SELECT * FROM document")[0], {"label": "Renamed"})
     at = app()
     at.query_params["doc"] = "d1"
     at.switch_page("app_pages/document.py").run()
     assert not at.exception, at.exception
-    assert any("Text extraction failed" in e.value for e in at.error)
+    hist = at.dataframe[-1].value
+    assert {"carol", "bob", "system:ai"} <= set(hist["actor"])
+    assert isinstance(hist["event_ts"].iloc[0], (datetime,)) or hist["event_ts"].dtype.kind == "M"
 
-    click(at.button, "Request text extraction again")
+
+def test_concurrent_tag_change_is_kept_not_overwritten(fake):
+    """Bob attaches a tag while Alice has the page open; Alice saves her own
+    tag change without touching Bob's: Bob's tag must survive."""
+    seed(fake)
+    at = app()
+    at.query_params["doc"] = "d1"
+    at.switch_page("app_pages/document.py").run()
+    write.set_tags("bob", "d1", ["blue"], [])                 # concurrent change
+    at.multiselect(key="doc:d1:tags").set_value([]).run()     # Alice removes "red"
+    click(at.button, "Save tags")
     at.run()
     assert not at.exception, at.exception
-    click(at.sidebar.button, "Save to database")
-    at.run()
-    # The retry is a fresh document_file_log row: exactly what the stream feeds the task.
-    rows = [r for r in fake.tables["document_file_log"] if r["file_id"] == "f1"]
-    assert len(rows) == 2 and rows[-1]["active"] is True
-    assert not any("AI_PARSE_DOCUMENT" in q for q in fake.queries)
+    assert [r["tag_id"] for r in fake.rows("SELECT tag_id FROM document_tag")] == ["blue"]
 
 
-def test_admin_text_extraction_tab(fake):
-    fake.task_state = "suspended"
-    at = app().run()
-    at.switch_page("app_pages/admin.py").run()
-    assert not at.exception, at.exception
-    assert any("suspended" in w.value for w in at.warning)
-    click(at.button, "Run extraction now")
-    at.run()
-    assert "EXECUTE TASK extract_text_task" in fake.executed
-
-
-def test_persistent_autosave_failure_warns(fake, monkeypatch):
-    from core import snapshot
-
-    def broken(*args, **kwargs):
-        raise RuntimeError("stage unavailable")
-
-    monkeypatch.setattr(snapshot, "write_snapshot", broken)
-    at = app().run()
-    at.switch_page("app_pages/tags.py").run()
-    at.text_input[0].input("Urgent")
-    click(at.button, "Add")
+def test_concurrent_metadata_edit_is_a_conflict(fake):
+    seed(fake)
+    at = app()
+    at.query_params["doc"] = "d1"
+    at.switch_page("app_pages/document.py").run()
+    write.set_metadata("bob", "d1", "m1", "13", 1)            # concurrent change
+    at.text_input(key="doc:d1:meta:m1").input("14")
+    click(at.button, "Save metadata")
     at.run()
     assert not at.exception, at.exception
-    assert any("automatic save to your session folder failed" in w.value
-               for w in at.sidebar.warning)
-    # The change itself is kept in memory and can still go to the database.
-    click(at.sidebar.button, "Save to database")
-    at.run()
-    assert [r["label"] for r in fake.tables["tag_log"]] == ["Urgent"]
+    assert any("changed by someone else" in e.value for e in at.error)
+    assert fake.rows("SELECT value FROM document_metadata") == [{"value": "13"}]
+    assert at.text_input(key="doc:d1:meta:m1").value == "13"  # draft reset to the latest

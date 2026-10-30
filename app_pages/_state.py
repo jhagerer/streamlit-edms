@@ -1,9 +1,13 @@
-"""Tier 1: this browser session's appends. The only module touching
-``st.session_state``.
+"""Per-browser-session helpers. The only page module touching ``st.session_state``.
 
-Session state holds appends only — never committed rows. What a page renders
-is ``view(table)``: the shared cached committed frame concatenated with these
-appends, recomputed on every rerun and never stored.
+There is no local copy of any data: the one global state is in Snowflake.
+Session state holds only this rerun's change tokens, the user's notices, the
+versions the user last saw (for conflict checks), the warehouse check, and
+the Setup page's log and generated key pair.
+
+Every write goes straight to Snowflake through ``write`` / ``act`` below; what
+a page renders comes from ``table(name)``, the shared cache keyed on the
+change counters read at the top of the rerun.
 """
 
 from __future__ import annotations
@@ -11,43 +15,34 @@ from __future__ import annotations
 import polars as pl
 import streamlit as st
 
-from core import read, schema, snapshot, write
-from core.schema import APPEND_TABLES
+from core import model, read
+from core.db import Conflict
 from core.session import actor
 
-_APPENDS = "appends"
 _TOKENS = "_tokens"
-_RESTORED = "_restored"
-_REPORT = "_restore_report"
-_DIRTY = "_dirty"  # the last automatic save to @sessions failed
-_AUTOSAVE_ERROR = "_autosave_error"
 _FLASH = "_flash"
-_SCOPE = "_scope"
+_WAREHOUSE = "_warehouse"
+_RENDERED = "_rendered"
+_BASELINE = "_baseline"
 
 
 # ── Per-rerun setup ──────────────────────────────────────────────────────────
 
 
 def begin_run() -> None:
-    """Called at the top of every rerun by streamlit_app.py: one token probe,
-    then restore-on-entry the first time."""
+    """Called at the top of every rerun by streamlit_app.py: one point query
+    for all change counters."""
     st.session_state[_TOKENS] = read.change_tokens()
-    scope = current_scope()
-    if st.session_state.get(_SCOPE) not in (None, scope):
-        # The connection now points at another account/role/db/schema. Pending
-        # rows belong to the old one: never flush them here. Start over and
-        # restore this connection's own snapshot instead.
-        _store().clear()
-        st.session_state[_RESTORED] = False
-    st.session_state[_SCOPE] = scope
-    if not st.session_state.get(_RESTORED):
-        _restore_on_entry()
-    retry_autosave()
 
 
-def current_scope() -> str:
-    """account/role/database/schema of the current connection (from the tokens)."""
-    return next(iter(tokens().values())).split("|", 1)[0]
+def try_begin_run() -> str | None:
+    """begin_run() for pages that must also work before the schema exists.
+    Returns the error message, or None on success."""
+    try:
+        begin_run()
+        return None
+    except Exception as exc:
+        return str(exc)
 
 
 def tokens() -> dict[str, str]:
@@ -56,159 +51,109 @@ def tokens() -> dict[str, str]:
     return st.session_state[_TOKENS]
 
 
+def refresh() -> None:
+    """Re-read the change counters (after this rerun wrote something)."""
+    st.session_state[_TOKENS] = read.change_tokens()
+
+
 def user() -> str:
     return actor()
 
 
-def _restore_on_entry() -> None:
-    frames = read.restore(user(), tokens())
-    _store().clear()
-    _store().update(frames)
-    st.session_state[_RESTORED] = True
-    counts = {t: df.height for t, df in frames.items() if df.height}
-    if counts:
-        st.session_state[_REPORT] = counts
+def warehouse() -> tuple[str | None, str | None]:
+    """(current warehouse, type), checked once per scope and browser session."""
+    scope = read.scope_of(tokens())
+    cached = st.session_state.get(_WAREHOUSE)
+    if not cached or cached[0] != scope:
+        cached = (scope, *read.warehouse_type())
+        st.session_state[_WAREHOUSE] = cached
+    return cached[1], cached[2]
 
 
-# ── The appends store ────────────────────────────────────────────────────────
+# ── Reading (shared cache, keyed on the change counters) ─────────────────────
 
 
-def _store() -> dict[str, pl.DataFrame]:
-    if _APPENDS not in st.session_state:
-        st.session_state[_APPENDS] = {}
-    return st.session_state[_APPENDS]
+def table(name: str) -> pl.DataFrame:
+    return read.load(name, read.token_for(name, tokens()))
 
 
-def appends(table: str) -> pl.DataFrame:
-    df = _store().get(table)
-    return df if df is not None else schema.empty(table)
+def files(include_inactive: bool = False) -> pl.DataFrame:
+    """Attached files with their stored details and AI state."""
+    return model.files_view(table("document_file"), table("stored_file"),
+                            table("ai_status_v"), include_inactive)
 
 
-def all_appends() -> dict[str, pl.DataFrame]:
-    return {t: df for t, df in _store().items() if df is not None and df.height}
-
-
-def set_appends(table: str, df: pl.DataFrame | None) -> None:
-    if df is None or not df.height:
-        _store().pop(table, None)
-    else:
-        _store()[table] = schema.conform(table, df)
-
-
-def add_appends(table: str, rows: list[dict]) -> None:
-    """Validate (loudly), add rows to tier 1, and save them to tier 2 right
-    away. ``_pending`` is not set here; ``view()`` adds it at render time."""
-    if rows:
-        append_many({table: rows})
-
-
-def append_many(batch: dict[str, list[dict]]) -> None:
-    """Validate everything first, then add — so a bad row adds nothing. Then
-    save the changed tables to the session folder automatically."""
-    frames = {t: write.rows_frame(t, rows) for t, rows in batch.items() if rows}
-    for table, new in frames.items():
-        cur = _store().get(table)
-        _store()[table] = new if cur is None else pl.concat([cur, new], how="vertical_relaxed")
-    if frames:
-        _autosave(list(frames))
-
-
-def _autosave(tables: list[str] | None = None) -> bool:
-    """Tier 1 -> tier 2 for the given tables (all when None). Never raises: a
-    failed save is remembered, shown in the sidebar and retried on the next
-    rerun (with all tables, so nothing is missed)."""
-    try:
-        write.save_to_session(user(), all_appends(), tables=tables)
-        st.session_state[_DIRTY] = False
-        st.session_state.pop(_AUTOSAVE_ERROR, None)
-        return True
-    except Exception as exc:
-        st.session_state[_DIRTY] = True
-        st.session_state[_AUTOSAVE_ERROR] = str(exc)
-        return False
-
-
-def retry_autosave() -> None:
-    """Called every rerun: if the last automatic save failed, try again."""
-    if st.session_state.get(_DIRTY) and has_pending():
-        _autosave()
-
-
-def autosave_error() -> str | None:
-    """The error of the last failed automatic save, or None."""
-    if st.session_state.get(_DIRTY) and has_pending():
-        return st.session_state.get(_AUTOSAVE_ERROR, "unknown error")
-    return None
-
-
-def clear_appends() -> None:
-    _store().clear()
-    st.session_state[_DIRTY] = False
-
-
-def pending_counts() -> dict[str, int]:
-    return {t: appends(t).height for t in APPEND_TABLES if appends(t).height}
-
-
-def has_pending() -> bool:
-    return bool(pending_counts())
-
-
-# ── Reading ──────────────────────────────────────────────────────────────────
-
-
-def view(table: str) -> pl.DataFrame:
-    return read.view(table, appends(table), tokens())
-
-
-def ocr_status() -> pl.DataFrame:
-    """Latest text-extraction status per file (written by the Snowflake task).
-    Empty while the pipeline is not set up yet (e.g. ocr_status_v missing), so
-    the pages keep working; the files then show as 'waiting'."""
-    try:
-        return read.load_ocr_status(tokens()["ocr_log"])
-    except Exception:
-        return schema.empty("ocr_log")
+def document_table() -> pl.DataFrame:
+    return model.document_table(
+        table("document"), table("document_type"), files(), table("document_metadata"),
+        table("document_tag"), table("tag"), table("document_enrichment_current"),
+    )
 
 
 # ── Writing ──────────────────────────────────────────────────────────────────
 
 
-def _prune_committed() -> None:
-    """After a partial flush, drop rows that did make it into the database, so a
-    retry does not insert them twice."""
-    fresh = read.change_tokens()
-    st.session_state[_TOKENS] = fresh
-    for table, df in list(all_appends().items()):
-        committed = (
-            read.load_log(table, fresh[table]) if table in schema.READ_TABLES
-            else read.load_event_ids(table, fresh[table])
-        )
-        set_appends(table, read.clean_restored(df, committed))
+def rendered(key: str, current):
+    """What the user saw when this page was last drawn.
+
+    A click reruns the script, which reloads the data first — so the version
+    check must use the value from the *previous* render, not the one just
+    loaded, or a concurrent edit would never be detected. Returns that value
+    (``current`` on the first render) and remembers ``current`` for the next
+    rerun. Used for row versions and for sets such as the attached tags."""
+    store = st.session_state.setdefault(_RENDERED, {})
+    seen = store.get(key, current)
+    store[key] = current
+    return seen
 
 
-def save_to_database() -> dict[str, int]:
-    """Insert, remove snapshot folder, clear tier 1 — in that order."""
+def baseline(widget_key: str, current):
+    """The value an input widget started from — the basis of the conflict check
+    for drafts. Captured when the widget is first drawn (its key is not in
+    session state yet) and kept, however often the page reloads meanwhile,
+    until the widget is reset (after saving or a conflict) or disappears."""
+    store = st.session_state.setdefault(_BASELINE, {})
+    if widget_key not in st.session_state or widget_key not in store:
+        store[widget_key] = current
+    return store[widget_key]
+
+
+def reset_widgets(prefix: str) -> None:
+    """Forget widget drafts (and their baselines) whose key starts with
+    ``prefix`` so they show the latest values again."""
+    for k in [k for k in st.session_state.keys() if str(k).startswith(prefix)]:
+        del st.session_state[k]
+    store = st.session_state.get(_BASELINE, {})
+    for k in [k for k in store if k.startswith(prefix)]:
+        del store[k]
+
+
+def act(fn, *args, success: str | None = None, reset: str | None = None, **kwargs) -> bool:
+    """Run one write command; turn conflicts and errors into notices.
+    Returns True when something was written. Widget drafts under the ``reset``
+    key prefix are cleared after a save or a conflict, so they show the latest
+    data (including other people's changes)."""
     try:
-        counts = write.flush(user(), all_appends())
-    except Exception:
-        _prune_committed()
-        raise
-    clear_appends()
-    st.session_state[_TOKENS] = read.change_tokens()
-    return counts
+        applied = fn(*args, **kwargs)
+    except Conflict as exc:
+        flash(str(exc), "error")
+        if reset:
+            reset_widgets(reset)
+        return False
+    except Exception as exc:
+        flash(f"Saving failed: {exc}", "error")
+        return False
+    if reset:
+        reset_widgets(reset)
+    if applied is False:
+        flash("This change had already been saved.", "info")
+        return False
+    if success:
+        flash(success)
+    return True
 
 
-def discard_session() -> None:
-    snapshot.remove_snapshots(user())
-    clear_appends()
-
-
-# ── Restore notice and flash messages ────────────────────────────────────────
-
-
-def take_restore_report() -> dict[str, int] | None:
-    return st.session_state.pop(_REPORT, None)
+# ── Notices ──────────────────────────────────────────────────────────────────
 
 
 def flash(message: str, kind: str = "success") -> None:
@@ -220,13 +165,8 @@ def take_flashes() -> list[tuple[str, str]]:
 
 
 def debug_state() -> dict:
-    """What tier 1 holds, for the diagnostics page."""
-    return {
-        "restored": st.session_state.get(_RESTORED, False),
-        "autosave_failed": st.session_state.get(_DIRTY, False),
-        "appends": {t: df.height for t, df in _store().items()},
-        "session_state_keys": sorted(str(k) for k in st.session_state.keys()),
-    }
+    """What session state holds, for the diagnostics page: no data rows."""
+    return {"session_state_keys": sorted(str(k) for k in st.session_state.keys())}
 
 
 # ── Setup page log ───────────────────────────────────────────────────────────
@@ -240,16 +180,6 @@ def setup_log_add(sql: str, ok: bool, message: str) -> None:
 
 def setup_log() -> list[tuple[bool, str, str]]:
     return st.session_state.get(_SETUP_LOG, [])
-
-
-def try_begin_run() -> str | None:
-    """begin_run() for pages that must also work before the schema exists.
-    Returns the error message, or None on success."""
-    try:
-        begin_run()
-        return None
-    except Exception as exc:
-        return str(exc)
 
 
 # ── Key pair generated on the Setup page (this browser session only) ─────────

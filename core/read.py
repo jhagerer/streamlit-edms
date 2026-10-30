@@ -1,55 +1,60 @@
-"""The read path: change tokens, cached bulk loaders, reduction and merge.
+"""The read path: change tokens and cached bulk loads.
 
-All reads are bulk. Each table is loaded whole into a polars frame, keyed on
-its change token, and shared by every viewer through the Streamlit cache. The
-UI never issues per-interaction queries except the token probe (and the
-Text tab / search, which touch ``document_text``). ``document_text`` and
-``ocr_log`` are written only by the extraction task inside Snowflake; the app
-reads them.
+There is one global state, in Snowflake. The app keeps no copy of it in a
+session; it caches *query results* where that is cheap and safe:
+
+* The current-state tables are small (one row per entity) and are loaded
+  whole into polars frames, cached and shared by all viewers.
+* The cache key is the table's change counter from sync_state, which every
+  write bumps in the same transaction. One point query on that hybrid table per
+  rerun tells the app which frames are stale — no invalidation logic anywhere.
+* A TTL is the safety net for writes made outside the app.
+
+document_text (large OCR text) and change_log (history) are never bulk-loaded;
+they are queried per document.
 """
 
 from __future__ import annotations
 
+import json
 import time
 
 import polars as pl
 
-from core import schema
-from core.schema import APPEND_TABLES, READ_TABLES, TOKEN_TABLES
-from core.session import cache_data, get_session
+from core import db, schema
+from core.schema import LOADED, TOKEN_TABLES
+from core.session import cache_data
+
+CACHE_TTL = 600  # seconds; safety net for writes made outside the app
+
+_TOKEN_SQL = (
+    "SELECT CURRENT_ACCOUNT(), CURRENT_ROLE(), CURRENT_DATABASE(), CURRENT_SCHEMA(), "
+    "(SELECT OBJECT_AGG(table_name, TO_VARIANT(seq)) FROM sync_state)"
+)
+
 
 # ── Tokens ───────────────────────────────────────────────────────────────────
 
 
-def _probe_one(session, table: str) -> str:
-    try:
-        row = session.sql(f"SELECT SYSTEM$LAST_CHANGE_COMMIT_TIME('{table}')").collect()[0]
-        return str(row[0])
-    except Exception:
-        # Fallback that is still cheap and still moves on every append.
-        row = session.sql(f"SELECT COUNT(*), MAX(event_ts) FROM {table}").collect()[0]
-        return f"{row[0]}:{row[1]}"
-
-
-_SCOPE_SQL = "CURRENT_ACCOUNT(), CURRENT_ROLE(), CURRENT_DATABASE(), CURRENT_SCHEMA()"
-
-
 def change_tokens() -> dict[str, str]:
-    """One round trip, all tokens. Deliberately NOT cached: the UI is always
-    consistent with the database as of this rerun.
+    """One round trip: the connection scope plus every table's change counter.
+    Deliberately NOT cached: the screen always matches the database as of
+    this rerun. The scope keeps viewers on different connections apart."""
+    row = db.query(_TOKEN_SQL)[0]
+    scope = "/".join(str(v) for v in row[:4])
+    raw = row[4]
+    seqs = raw if isinstance(raw, dict) else json.loads(raw or "{}")
+    seqs = {str(k).lower(): v for k, v in seqs.items()}
+    return {t: f"{scope}|{seqs.get(t, 0)}" for t in TOKEN_TABLES}
 
-    Each token starts with the connection scope (account/role/database/schema),
-    so viewers on different connections never share a cached frame."""
-    session = get_session()
-    cols = ", ".join(f"SYSTEM$LAST_CHANGE_COMMIT_TIME('{t}')" for t in TOKEN_TABLES)
-    try:
-        row = session.sql(f"SELECT {_SCOPE_SQL}, {cols}").collect()[0]
-        scope = "/".join(str(v) for v in row[:4])
-        return {t: f"{scope}|{row[4 + i]}" for i, t in enumerate(TOKEN_TABLES)}
-    except Exception:
-        row = session.sql(f"SELECT {_SCOPE_SQL}").collect()[0]
-        scope = "/".join(str(v) for v in row[:4])
-        return {t: f"{scope}|{_probe_one(session, t)}" for t in TOKEN_TABLES}
+
+def token_for(name: str, tokens: dict[str, str]) -> str:
+    """Cache key of a loaded table/view: the counters it depends on."""
+    return "+".join(tokens[t] for t in LOADED[name])
+
+
+def scope_of(tokens: dict[str, str]) -> str:
+    return next(iter(tokens.values())).split("|", 1)[0]
 
 
 def time_probe(n: int = 20) -> float:
@@ -63,114 +68,50 @@ def time_probe(n: int = 20) -> float:
 # ── Loaders ──────────────────────────────────────────────────────────────────
 
 
-def _arrow_to_polars(tbl) -> pl.DataFrame:
-    if tbl is None:
-        return pl.DataFrame()
-    return pl.from_arrow(tbl)
+@cache_data(ttl=CACHE_TTL)
+def load(name: str, token: str) -> pl.DataFrame:
+    """One whole table / view. ``token`` is a cache key, never in the query."""
+    if name not in LOADED:
+        raise ValueError(f"{name} is not bulk-loadable")
+    return schema.conform(name, db.query_frame(f"SELECT * FROM {name}"))
 
 
-def query_frame(sql: str, params: list | None = None) -> pl.DataFrame:
-    session = get_session()
-    return _arrow_to_polars(session.sql(sql, params=params).to_arrow())
-
-
-@cache_data
-def load_log(table: str, token: str) -> pl.DataFrame:
-    """Full rows. READ_TABLES only. ``token`` is a cache key, never in the query."""
-    if table not in READ_TABLES:
-        raise ValueError(f"{table} is not bulk-loadable")
-    return schema.conform(table, query_frame(f"SELECT * FROM {table}"))
-
-
-@cache_data
-def load_event_ids(table: str, token: str) -> pl.DataFrame:
-    """Ids only — for tables too large to bulk-load."""
-    if table not in TOKEN_TABLES:
-        raise ValueError(f"unknown table {table}")
-    df = query_frame(f"SELECT event_id FROM {table}")
-    if not df.width:
-        return pl.DataFrame(schema={"event_id": pl.Utf8})
-    return df.rename({df.columns[0]: "event_id"}).select(pl.col("event_id").cast(pl.Utf8))
-
-
-@cache_data
-def load_ocr_status(token: str) -> pl.DataFrame:
-    """Latest extraction status per file (ocr_status_v): one short row per
-    file, so it is bulk-loaded like the logs."""
-    return schema.conform("ocr_log", query_frame("SELECT * FROM ocr_status_v"))
-
-
-@cache_data
+@cache_data(ttl=CACHE_TTL)
 def load_texts(file_ids: tuple[str, ...], token: str) -> pl.DataFrame:
-    """Latest extracted text for a handful of files (the Text tab)."""
+    """Latest OCR text for a handful of files (the Text tab)."""
     if not file_ids:
-        return schema.empty("document_text")
+        return schema.empty("document_text_current")
     placeholders = ", ".join("?" for _ in file_ids)
-    df = query_frame(
-        f"SELECT * FROM document_text WHERE file_id IN ({placeholders})",
+    df = db.query_frame(
+        f"SELECT * FROM document_text_current WHERE file_id IN ({placeholders})",
         params=list(file_ids),
     )
-    return latest(schema.conform("document_text", df), schema.KEYS["document_text"])
+    return schema.conform("document_text_current", df)
+
+
+@cache_data(ttl=CACHE_TTL)
+def load_history(document_id: str, token: str) -> pl.DataFrame:
+    """Every human edit of one document, oldest first (index on document_id)."""
+    df = db.query_frame(
+        "SELECT * FROM change_log WHERE document_id = ? ORDER BY event_ts, event_id",
+        params=[document_id],
+    )
+    return schema.conform("change_log", df)
 
 
 def load_audit(limit: int = 5000) -> pl.DataFrame:
-    df = query_frame(f"SELECT * FROM audit_v ORDER BY event_ts DESC LIMIT {int(limit)}")
+    df = db.query_frame(f"SELECT * FROM audit_v ORDER BY event_ts DESC LIMIT {int(limit)}")
     return df.rename({c: c.lower() for c in df.columns})
 
 
-# ── Reduction and merge (pure) ───────────────────────────────────────────────
-
-
-def latest(log: pl.DataFrame, keys: list[str]) -> pl.DataFrame:
-    """Current state: the last row per key by (event_ts, event_id). The event_id
-    tie-break makes the reduction deterministic for rows of one flush, which
-    share a timestamp."""
-    return log.sort(["event_ts", "event_id"]).unique(
-        subset=keys, keep="last", maintain_order=True
-    )
-
-
-def compose(committed: pl.DataFrame, appends: pl.DataFrame | None) -> pl.DataFrame:
-    """Committed rows + this session's appends, annotating ``_pending``."""
-    db = committed.with_columns(pl.lit(False).alias("_pending"))
-    if appends is None or not appends.height:
-        return db
-    return pl.concat(
-        [db, appends.with_columns(pl.lit(True).alias("_pending"))],
-        how="vertical_relaxed",
-    )
-
-
-def view(table: str, appends: pl.DataFrame | None, tokens: dict[str, str]) -> pl.DataFrame:
-    """Committed rows (cached, shared) + this session's appends (tier 1).
-
-    Takes appends and tokens as arguments so core/ never imports from the
-    pages. The result is recomputed every rerun and never stored."""
-    return compose(load_log(table, tokens[table]), appends)
-
-
-def clean_restored(snap: pl.DataFrame | None, committed_ids: pl.DataFrame) -> pl.DataFrame | None:
-    """Drop staged rows that are already committed. Pure: no I/O."""
-    if snap is None or not snap.height:
-        return None
-    if not committed_ids.height:
-        return snap
-    return snap.join(committed_ids.select("event_id"), on="event_id", how="anti")
-
-
-def restore(user: str, tokens: dict[str, str]) -> dict[str, pl.DataFrame]:
-    """Tier 2 minus tier 3: this user's snapshot rows that are still uncommitted.
-    Returns the frames; the caller puts them into tier 1."""
-    from core import snapshot
-
-    snaps = snapshot.read_all(user)
-    restored: dict[str, pl.DataFrame] = {}
-    for table in APPEND_TABLES:
-        snap = snaps.get(table)
-        if snap is None:
-            continue
-        committed = load_log(table, tokens[table])
-        mine = clean_restored(schema.conform(table, snap), committed)
-        if mine is not None and mine.height:
-            restored[table] = mine
-    return restored
+def warehouse_type(session=None) -> tuple[str | None, str | None]:
+    """(current warehouse, its type) — e.g. ('MINIDMS_WH', 'ADAPTIVE')."""
+    name = db.query("SELECT CURRENT_WAREHOUSE()", session=session)[0][0]
+    if not name:
+        return None, None
+    safe = str(name).replace("'", "''")
+    rows = db.query(f"SHOW WAREHOUSES LIKE '{safe}'", session=session)
+    if not rows:
+        return str(name), None
+    d = {k.lower().strip('"'): v for k, v in rows[0].as_dict().items()}
+    return str(name), (str(d.get("type")) if d.get("type") is not None else None)

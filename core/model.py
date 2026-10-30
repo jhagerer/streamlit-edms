@@ -1,139 +1,126 @@
-"""Current state, derived from event logs. Pure polars; no I/O.
+"""What the pages show, built from the loaded tables. Pure polars; no I/O.
 
-Every function takes frames as returned by ``read.view()`` (committed rows
-plus this session's appends, with ``_pending``) and reduces them.
+The tables already hold current state (hybrid tables are updated in place;
+the views pick the latest AI result per file), so this module only joins and
+filters.
 """
 
 from __future__ import annotations
 
+import json
+
 import polars as pl
 
-from core.read import latest
-from core.schema import KEYS
+AI_STATE_LABELS = {
+    "missing": "Not requested yet — use “Process again”.",
+    "queued": "Queued — OCR and enrichment are running in Snowflake.",
+    "done": "Text extracted and enriched.",
+    "failed": "AI processing failed.",
+    "skipped": "No text extraction for this file type.",
+}
 
 
-def _pending_col(df: pl.DataFrame) -> pl.DataFrame:
-    if "_pending" not in df.columns:
-        return df.with_columns(pl.lit(False).alias("_pending"))
-    return df
+def parse_list(value) -> list:
+    """ARRAY columns arrive as JSON text."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    try:
+        out = json.loads(value)
+    except (TypeError, ValueError):
+        return []
+    return out if isinstance(out, list) else []
 
 
-def documents(doc_log: pl.DataFrame) -> pl.DataFrame:
-    """One row per document with lifecycle columns. Includes trashed ones."""
-    doc_log = _pending_col(doc_log)
-    created = doc_log.group_by("document_id").agg(
-        pl.col("event_ts").min().alias("created_at"),
-        pl.col("actor").sort_by(["event_ts", "event_id"]).first().alias("created_by"),
-        pl.col("_pending").any().alias("_doc_pending"),
-    )
-    cur = latest(doc_log, KEYS["document_log"]).rename(
-        {"event_ts": "updated_at", "actor": "updated_by"}
-    )
-    return (
-        cur.join(created, on="document_id", how="left")
-        .with_columns((pl.col("op") == "trash").alias("trashed"))
-        .drop("event_id")
-    )
-
-
-def definitions(log: pl.DataFrame, table: str, include_inactive: bool = False) -> pl.DataFrame:
+def definitions(df: pl.DataFrame, include_inactive: bool = False) -> pl.DataFrame:
     """Document types, metadata types, tags."""
-    cur = latest(_pending_col(log), KEYS[table])
     if not include_inactive:
-        cur = cur.filter(pl.col("active").fill_null(True))
-    return cur.sort("label", nulls_last=True)
+        df = df.filter(pl.col("active").fill_null(True))
+    return df.sort("label", nulls_last=True)
 
 
-def current_files(file_log: pl.DataFrame, include_inactive: bool = False) -> pl.DataFrame:
-    cur = latest(_pending_col(file_log), KEYS["document_file_log"])
-    if not include_inactive:
-        cur = cur.filter(pl.col("active").fill_null(True))
-    return cur.sort("event_ts")
-
-
-def current_metadata(meta_log: pl.DataFrame) -> pl.DataFrame:
-    """Latest value per (document, metadata type); empty value = removed."""
-    cur = latest(_pending_col(meta_log), KEYS["metadata_log"])
-    return cur.filter(pl.col("value").is_not_null() & (pl.col("value") != ""))
-
-
-def current_tags(assign_log: pl.DataFrame) -> pl.DataFrame:
-    """Latest link per (document, tag); assigned = FALSE means detached."""
-    cur = latest(_pending_col(assign_log), KEYS["tag_assignment_log"])
-    return cur.filter(pl.col("assigned").fill_null(False))
-
-
-def document_table(
-    doc_log: pl.DataFrame,
-    doc_type_log: pl.DataFrame,
-    file_log: pl.DataFrame,
-    meta_log: pl.DataFrame,
-    assign_log: pl.DataFrame,
-    tag_log: pl.DataFrame,
-) -> pl.DataFrame:
-    """The list the Documents page renders: one row per document, joined to its
-    type, tags, files and metadata. ``pending`` is true when any of the
-    document's rows are still unsaved."""
-    docs = documents(doc_log)
-    types = definitions(doc_type_log, "document_type_log", include_inactive=True).select(
-        "document_type_id", pl.col("label").alias("document_type")
+def files_view(document_file: pl.DataFrame, stored_file: pl.DataFrame,
+               ai_status: pl.DataFrame, include_inactive: bool = False) -> pl.DataFrame:
+    """Attached files with their stored details and AI state."""
+    links = document_file if include_inactive else document_file.filter(pl.col("active"))
+    stored = stored_file.unique(subset=["file_id"], keep="first").drop("document_id")
+    out = (
+        links.join(stored, on="file_id", how="left")
+        .join(ai_status, on="file_id", how="left")
     )
-    files = current_files(file_log)
+    return out.with_columns(
+        pl.when(pl.col("requested_at").is_null()).then(pl.lit("missing"))
+        .when(pl.col("pending").fill_null(False)).then(pl.lit("queued"))
+        .when((pl.col("text_status") == "failed") | (pl.col("enrich_status") == "failed"))
+        .then(pl.lit("failed"))
+        .when(pl.col("text_status") == "skipped").then(pl.lit("skipped"))
+        .otherwise(pl.lit("done"))
+        .alias("ai_state")
+    ).sort("created_at")
+
+
+def _doc_ai_state(states: pl.Expr) -> pl.Expr:
+    return (
+        pl.when(states.list.contains("queued")).then(pl.lit("queued"))
+        .when(states.list.contains("failed")).then(pl.lit("failed"))
+        .when(states.list.contains("missing")).then(pl.lit("missing"))
+        .when(states.list.len() == 0).then(pl.lit(None, dtype=pl.Utf8))
+        .otherwise(pl.lit("done"))
+    )
+
+
+def document_table(docs: pl.DataFrame, types: pl.DataFrame, files: pl.DataFrame,
+                   doc_meta: pl.DataFrame, doc_tags: pl.DataFrame, tags: pl.DataFrame,
+                   enrich: pl.DataFrame) -> pl.DataFrame:
+    """One row per document, joined to its type, files, tags, metadata and
+    AI summary."""
+    type_labels = types.select("document_type_id", pl.col("label").alias("document_type"))
     file_agg = files.group_by("document_id").agg(
         pl.len().alias("files"),
         pl.col("filename").alias("filenames"),
-        pl.col("_pending").any().alias("_file_pending"),
+        pl.col("ai_state").alias("_states"),
     )
-    tag_defs = definitions(tag_log, "tag_log", include_inactive=True).select(
-        "tag_id", pl.col("label").alias("tag_label"), pl.col("active").alias("tag_active")
-    )
-    all_links = _pending_col(assign_log)
-    tag_pending = all_links.group_by("document_id").agg(pl.col("_pending").any().alias("_tag_pending"))
-    tags = (
-        current_tags(assign_log)
-        .join(tag_defs, on="tag_id", how="left")
+    tag_agg = (
+        doc_tags.join(tags.select("tag_id", pl.col("label").alias("tag_label"),
+                                  pl.col("active").alias("tag_active")), on="tag_id", how="left")
         .filter(pl.col("tag_active").fill_null(True))
         .group_by("document_id")
         .agg(pl.col("tag_id").alias("tag_ids"), pl.col("tag_label").sort().alias("tags"))
     )
-    meta_all = _pending_col(meta_log)
-    meta_pending = meta_all.group_by("document_id").agg(pl.col("_pending").any().alias("_meta_pending"))
-    meta = current_metadata(meta_log).group_by("document_id").agg(
-        pl.col("value").str.join(" ").alias("metadata_text")
+    meta_agg = doc_meta.group_by("document_id").agg(
+        pl.col("value").str.join(" ").alias("metadata_text"))
+    summary = (
+        enrich.filter(pl.col("status") == "done")
+        .sort("created_at")
+        .group_by("document_id")
+        .agg(pl.col("summary").last().alias("summary"))
     )
     out = (
-        docs.join(types, on="document_type_id", how="left")
+        docs.join(type_labels, on="document_type_id", how="left")
         .join(file_agg, on="document_id", how="left")
-        .join(tags, on="document_id", how="left")
-        .join(tag_pending, on="document_id", how="left")
-        .join(meta, on="document_id", how="left")
-        .join(meta_pending, on="document_id", how="left")
+        .join(tag_agg, on="document_id", how="left")
+        .join(meta_agg, on="document_id", how="left")
+        .join(summary, on="document_id", how="left")
         .with_columns(
             pl.col("files").fill_null(0),
             pl.col("filenames").fill_null([]),
             pl.col("tags").fill_null([]),
             pl.col("tag_ids").fill_null([]),
             pl.col("metadata_text").fill_null(""),
-            pl.any_horizontal(
-                pl.col("_doc_pending").fill_null(False),
-                pl.col("_file_pending").fill_null(False),
-                pl.col("_tag_pending").fill_null(False),
-                pl.col("_meta_pending").fill_null(False),
-            ).alias("pending"),
+            pl.col("summary").fill_null(""),
+            pl.col("_states").fill_null([]),
+            (pl.col("status") == "trashed").alias("trashed"),
         )
-        .drop("_pending", "_doc_pending", "_file_pending", "_tag_pending", "_meta_pending")
+        .with_columns(_doc_ai_state(pl.col("_states")).alias("ai_state"))
+        .drop("_states")
     )
     return out.sort("updated_at", descending=True)
 
 
-def filter_documents(
-    table: pl.DataFrame,
-    text: str = "",
-    document_type_ids: list[str] | None = None,
-    tag_ids: list[str] | None = None,
-    trashed: bool = False,
-    ids: list[str] | None = None,
-) -> pl.DataFrame:
+def filter_documents(table: pl.DataFrame, text: str = "", document_type_ids: list[str] | None = None,
+                     tag_ids: list[str] | None = None, trashed: bool = False,
+                     ids: list[str] | None = None) -> pl.DataFrame:
     """In-memory filters. ``tag_ids`` requires all given tags."""
     out = table.filter(pl.col("trashed") == trashed)
     if ids is not None:
@@ -145,59 +132,43 @@ def filter_documents(
     text = (text or "").strip().lower()
     if text:
         hay = pl.concat_str(
-            [
-                pl.col("label").fill_null(""),
-                pl.col("description").fill_null(""),
-                pl.col("filenames").list.join(" "),
-                pl.col("metadata_text"),
-                pl.col("tags").list.join(" "),
-            ],
+            [pl.col("label").fill_null(""), pl.col("description").fill_null(""),
+             pl.col("filenames").list.join(" "), pl.col("metadata_text"),
+             pl.col("tags").list.join(" "), pl.col("summary")],
             separator=" ",
         ).str.to_lowercase()
         out = out.filter(hay.str.contains(text, literal=True))
     return out
 
 
-def history(log: pl.DataFrame, **match: str) -> pl.DataFrame:
-    """Unreduced events for one object, oldest first."""
-    out = _pending_col(log)
-    for col, value in match.items():
-        out = out.filter(pl.col(col) == value)
-    return out.sort(["event_ts", "event_id"])
+def suggestions(enrichment: dict | None, document: dict, tag_ids: list[str],
+                metadata: dict[str, str], active_type_ids: set[str], active_tag_ids: set[str],
+                metadata_types: dict[str, dict]) -> dict:
+    """What the AI suggests that differs from the current state, limited to
+    ids that exist and are active. Pure."""
+    out = {"document_type_id": None, "tag_ids": [], "metadata": {}}
+    if not enrichment or enrichment.get("status") != "done":
+        return out
+    t = enrichment.get("suggested_type_id")
+    if t and t in active_type_ids and t != document.get("document_type_id"):
+        out["document_type_id"] = t
+    out["tag_ids"] = [x for x in parse_list(enrichment.get("suggested_tag_ids"))
+                      if isinstance(x, str) and x in active_tag_ids and x not in tag_ids]
+    for item in parse_list(enrichment.get("extracted_metadata")):
+        if not isinstance(item, dict):
+            continue
+        mt_id, value = item.get("metadata_type_id"), str(item.get("value") or "").strip()
+        mt = metadata_types.get(mt_id)
+        if not mt or not mt.get("active", True) or not value:
+            continue
+        if mt.get("data_type") == "choice":
+            choices = [c.strip() for c in (mt.get("choices") or "").splitlines() if c.strip()]
+            if value not in choices:
+                continue
+        if metadata.get(mt_id) != value:
+            out["metadata"][mt_id] = value
+    return out
 
 
-TEXT_STATUS_LABELS = {
-    "unsaved": "Not saved yet — text is extracted after you save to the database.",
-    "waiting": "Saved — waiting for the extraction task to pick it up.",
-    "queued": "Queued — text extraction is running in Snowflake.",
-    "done": "Text extracted.",
-    "failed": "Text extraction failed.",
-    "skipped": "No text extraction for this file type.",
-}
-
-
-def file_text_status(files: pl.DataFrame, ocr_status: pl.DataFrame) -> pl.DataFrame:
-    """Add ``text_status``, ``ocr_message`` and ``ocr_pages`` to current files.
-
-    * unsaved — the file row (or a retry of it) is still pending in this session
-    * waiting — saved, but the task has not written a status yet, or the last
-      failed/skipped status is older than a later resubmission
-    * queued / done / failed / skipped — from ocr_status_v
-    """
-    files = files if "_pending" in files.columns else files.with_columns(
-        pl.lit(False).alias("_pending"))
-    ocr = ocr_status.select(
-        "file_id",
-        pl.col("status").alias("ocr_state"),
-        pl.col("event_ts").alias("ocr_ts"),
-        pl.col("message").alias("ocr_message"),
-        pl.col("page_count").alias("ocr_pages"),
-    )
-    out = files.join(ocr, on="file_id", how="left")
-    stale = pl.col("ocr_state").is_in(["failed", "skipped"]) & (pl.col("ocr_ts") < pl.col("event_ts"))
-    return out.with_columns(
-        pl.when(pl.col("_pending")).then(pl.lit("unsaved"))
-        .when(pl.col("ocr_state").is_null() | stale).then(pl.lit("waiting"))
-        .otherwise(pl.col("ocr_state"))
-        .alias("text_status")
-    ).drop("ocr_state", "ocr_ts")
+def has_suggestions(s: dict) -> bool:
+    return bool(s["document_type_id"] or s["tag_ids"] or s["metadata"])

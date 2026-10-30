@@ -1,56 +1,85 @@
 # MiniDMS — a small document management system on Snowflake
 
 A deliberately small clone of [Mayan EDMS](https://www.mayan-edms.com/), built with
-Streamlit. It runs **in Streamlit in Snowflake** (container runtime) and **locally**
-on your laptop. Both versions keep all data in Snowflake.
+Streamlit. It runs **in Streamlit in Snowflake** (container runtime), **locally**, and on
+**Streamlit Community Cloud**. All data lives in Snowflake.
 
-Features: upload, immutable files with SHA-256 checksums, OCR / text extraction with
-`AI_PARSE_DOCUMENT`, full-text search, document types, typed metadata, tags, trash,
-per-document history and an audit trail.
+Features: upload, immutable content-addressed files with SHA-256 checksums, OCR and AI
+enrichment with `AI_COMPLETE` (summary, document-type and tag suggestions, metadata
+extraction), full-text search, document types, typed metadata, tags, trash, conflict
+detection for concurrent edits, per-document history and an audit trail — with
+column-level lineage for everything the AI produces.
 
-Design: [`docs/09-streamlit-architecture.md`](docs/09-streamlit-architecture.md) ·
-Plan: [`docs/10-streamlit-implementation-plan.md`](docs/10-streamlit-implementation-plan.md) ·
+Original design: [`docs/09-streamlit-architecture.md`](docs/09-streamlit-architecture.md) ·
+[`docs/10-streamlit-implementation-plan.md`](docs/10-streamlit-implementation-plan.md)
+(the architecture has since moved on — see below) ·
 Schema: [`sql/minidms-setup.sql`](sql/minidms-setup.sql)
 
-## The four decisions
+## Architecture
 
-1. **All reads are bulk.** Each table is loaded whole into a polars frame. The frame is cached
-   and keyed on the table's change token (`SYSTEM$LAST_CHANGE_COMMIT_TIME`).
-2. **All writes are appends.** No `UPDATE`, no `DELETE`. The current state is the latest
-   row per key.
-3. **Session state is durable.** Every change is saved automatically, right away, as
-   parquet files in `@sessions/<you>/`. Unsaved work comes back the next time you open
-   the app.
-4. **Writing has two stages.** The automatic save keeps your changes private in
-   `@sessions`; *Save to database* inserts them into the log tables for everyone.
+1. **One global state, in Snowflake.** There is no local or per-session copy of any
+   data and no separate save step: every change is written to Snowflake immediately.
+2. **Hybrid tables for everything people edit.** Documents, metadata values, tags, file
+   attachments and the definitions (types, metadata types, tags) are hybrid tables with
+   enforced primary keys and a `version` per row. Each edit is one transaction:
+   - a row in `change_log` — its `event_id` is the **idempotency key** (enforced primary
+     key), so a retried action is rejected as a whole and never applied twice;
+   - the change, `… WHERE version = <the version the user saw>` — if someone else
+     changed it first, nothing is written and the user sees a **conflict** message;
+   - a bump of the touched tables' counters in `sync_state`.
+3. **Standard tables for facts and AI output.** Uploaded files (`stored_file`), AI
+   requests, OCR text and enrichments are append-only standard tables, written by
+   `INSERT … SELECT` inside Snowflake — so Snowflake records **column-level lineage** from
+   the file to the text to the summary and suggestions.
+4. **AI runs in Snowflake, right after the save.** An upload appends to `ai_request`; a
+   stream on it fires a triggered task, which calls `process_ai()`: OCR and enrichment
+   with `AI_COMPLETE` (`claude-sonnet-4-5`). The app never calls Cortex — the AI calls
+   take seconds to minutes and would block the shared Snowflake session for every
+   viewer, and calling it from the app would lose the lineage.
+5. **Only adaptive compute.** One adaptive warehouse, `minidms_wh`, runs the app's queries
+   and the AI task. The app refuses to run on any other kind of warehouse; there are no
+   serverless tasks.
+6. **Caching where it is cheap and safe.** The current-state tables are small (one row
+   per entity) and are loaded whole into polars frames, cached and shared by all
+   viewers. The cache key is the table's counter in `sync_state`, read with one point
+   query per click; a 10-minute TTL covers writes made outside the app. The large OCR
+   text and the history are queried per document, never bulk-loaded.
+
+### Where hybrid tables make sense — and where they don't
+
+| Data | Table type | Why |
+|---|---|---|
+| Documents, metadata values, tags, attachments, definitions | **hybrid** | Edited one data point at a time by people; enforced primary keys and row versions give conflict detection instead of last-writer-wins |
+| `change_log` | **hybrid** | Its `event_id` primary key makes every action idempotent; indexed by document for the History tab |
+| `sync_state` | **hybrid** | One point read per click, small point updates on every write — exactly what hybrid tables are fast at |
+| `stored_file`, `ai_request`, `document_text`, `document_enrichment`, `ai_job_log` | standard | Append-only facts written by `INSERT … SELECT`; large text, full-text search and lineage; scans and the result cache work better on standard tables |
 
 ## Project layout
 
 ```
-streamlit_app.py        entry point (st.navigation, one token probe per rerun, restore on entry)
+streamlit_app.py        entry point (st.navigation, one counter probe per rerun, warehouse gate)
 app_pages/              Streamlit pages
-  _state.py             tier-1 appends store — the only page module touching st.session_state
-  _ui.py                sidebar, dialogs, document list, metadata widgets
+  _state.py             per-session helpers: counters, cached tables, act(), conflict baselines
+  _ui.py                sidebar, notices, warehouse gate, document list, metadata widgets
   documents.py upload.py search.py trash.py document.py
   document_types.py metadata_types.py tags.py audit.py admin.py diagnostics.py
   setup.py              runs the setup SQL step by step from inside the app
   _connection.py        Setup step 1: enter/change Snowflake credentials, key pairs
 core/                   plain Python (no Streamlit, except core/session.py)
   session.py            Snowpark session (SiS, own credentials, or secrets), viewer
-                        identity, cache decorator; keeps a viewer's own connection
-                        (never data) in st.session_state
-  schema.py             table columns, dtypes, reduction keys, READ_/APPEND_TABLES
-  read.py               change tokens, cached loaders, latest(), view(), restore()
-  snapshot.py           parquet snapshots on @sessions
-  write.py              row builders, validation, save_to_session() (automatic), flush()
+                        identity, cache decorator
+  db.py                 the one place SQL runs: per-session lock, transactions, conflicts
+  schema.py             tables, views, pinned dtypes; hybrid vs. standard
+  read.py               change counters (sync_state), cached loads, history, audit
+  write.py              commands: one transaction per action, version checks, change_log
   files.py              @doc_files upload ({checksum}/{filename}), orphan housekeeping
-  ocr.py                extraction task state, recent runs, run on demand
+  ai.py                 AI task state, recent runs, run on demand
+  model.py              what the pages show: documents, files + AI state, suggestions
+  search.py             SEARCH() / ILIKE over OCR text and summaries
   setup.py              setup script parsing, grants, schema status checks
   connection.py         connection settings → connector params, secrets.toml, key pairs
-  search.py             SEARCH() / ILIKE over document_text
-  model.py              current state: documents, tags, metadata, filters
 sql/                    setup DDL, grants and deployment
-tests/                  pytest; runs without Snowflake (fake session)
+tests/                  pytest; runs without Snowflake (SQLite-backed fake session)
 ```
 
 The pages folder is called `app_pages/` (not `pages/`), so Streamlit's automatic
@@ -60,57 +89,43 @@ multipage detection does not interfere with `st.navigation`.
 
 Two ways — both run the same idempotent statements (nothing is ever dropped):
 
-**A. From the app: System → Setup.** The page works before any MiniDMS object exists
-(when the schema is missing, every other page links to it). It walks through:
+**A. From the app: System → Setup.** The page works before any MiniDMS object (and
+before the adaptive warehouse) exists; when the schema is missing, every other page
+links to it. It walks through:
 
 1. **Connection** — shows account, user, role, warehouse, database, schema and where
-   the connection comes from. Outside Streamlit in Snowflake you can also:
-   - **enter or change credentials**: account, user, role, warehouse, database, schema,
-     and one of *key pair* (upload/paste a `.p8`, optional passphrase), *programmatic
-     access token*, *password + MFA passcode*, or *browser SSO* (own computer only).
-     *Test connection* checks them; *Connect for this browser session* uses them for you
-     only — kept in server memory, never written to disk, gone when the tab closes.
-     Leave a secret field empty to keep the one you entered before;
-   - **generate a key pair**: download the private key, get the
-     `ALTER USER … SET RSA_PUBLIC_KEY` statement, optionally run it right away;
-   - **save the connection permanently**: the page renders the `secrets.toml` section to
-     paste into Community Cloud (*Settings → Secrets*) or save locally;
-   - **switch database/schema/warehouse**, optionally creating them;
-   - **disconnect** or **reconnect** the shared connection after changing secrets.
-
-   In Streamlit in Snowflake there is nothing to enter — Snowflake provides the session.
-   While you have unsaved changes the connection cannot be changed (they belong to the
-   current account and schema).
-2. **Stages** — `@doc_files`, `@sessions`
-3. **Tables** — the seven event logs the app writes, plus `document_text` and `ocr_log`
-   (written only by the extraction task)
-4. **Views** — `audit_v`, `ocr_status_v`
-5. **Text extraction** — stream `document_file_log_stream`, procedure `extract_text()`,
-   triggered task `extract_text_task`, and `ALTER TASK … RESUME`
-6. **Grants** (optional) — `SELECT, INSERT` (no `UPDATE`/`DELETE`) for an app role;
-   `SELECT` only on `document_text`/`ocr_log`; `MONITOR, OPERATE` on the task
-7. **PyPI integration** (optional, SiS container runtime; usually ACCOUNTADMIN)
-8. **`CREATE STREAMLIT`** (shown for copying only)
-9. **Starter definitions** (optional) — a few document types, metadata types and tags,
-   added as pending changes you then *Save to database*
+   the connection comes from. Outside Streamlit in Snowflake you can also enter or
+   change credentials (key pair, programmatic access token, password + MFA passcode,
+   or browser SSO on your own computer), generate a key pair, render a `secrets.toml`,
+   switch database/schema/warehouse, and disconnect/reconnect. In Streamlit in Snowflake
+   there is nothing to enter.
+2. **Adaptive warehouse** — `minidms_wh` (then *Use minidms_wh now*)
+3. **Stage** — `@doc_files`
+4. **Hybrid tables** — the nine tables people edit, plus filling `sync_state`
+5. **Standard tables** — `stored_file`, `ai_request`, `document_text`,
+   `document_enrichment`, `ai_job_log`
+6. **Views** — latest text / enrichment per file, AI state per file, audit trail
+7. **AI pipeline** — stream `ai_request_stream`, procedure `process_ai()`, triggered task
+   `process_ai_task` on `minidms_wh`, and `ALTER TASK … RESUME`
+8. **Grants** (optional) — for an app role: `SELECT, INSERT, UPDATE` on the hybrid
+   tables (plus `DELETE` where removing is the operation: metadata values, tag
+   assignments), `SELECT, INSERT` only on `change_log`, `SELECT` only on the AI output,
+   `USAGE` on `minidms_wh`, `MONITOR, OPERATE` on the task
+9. **PyPI integration** (optional, SiS container runtime; usually ACCOUNTADMIN)
+10. **`CREATE STREAMLIT`** (shown for copying only)
+11. **Starter definitions** (optional) — a few document types, metadata types and tags
 
 Every statement is shown before it runs; each has its own *Run* button, and every step
-has *Run all*. A progress bar shows how many of the 17 objects exist (including whether the task is
-started); a log shows
-each result.
+has *Run all*. A progress bar shows how many of the 25 objects exist (including whether
+the warehouse is adaptive and the task is started); a log shows each result.
 
 Who may run the setup statements: on a local run, you; with credentials you entered
 yourself, you (Snowflake's privileges decide what succeeds). In Streamlit in Snowflake,
 only the app owner. On a shared deployment with login (e.g. Community Cloud) using the
-shared connection, only the users listed in `MINIDMS_SETUP_USERS`. Everyone else sees
-the statements read-only — but can always connect with their own credentials.
+shared connection, only the users listed in `MINIDMS_SETUP_USERS`.
 
 **B. In a worksheet.** Run [`sql/minidms-setup.sql`](sql/minidms-setup.sql), then adapt
 [`sql/minidms-grants-and-deploy.sql`](sql/minidms-grants-and-deploy.sql).
-
-Note: a role that *owns* the tables can always delete from them. To have the database
-enforce append-only, let a different role own the tables and grant the app role only
-`SELECT, INSERT`.
 
 ## 2a. Run in Streamlit in Snowflake
 
@@ -122,8 +137,10 @@ enforce append-only, let a different role own the tables and grant the app role 
    pool, and attach the PyPI external access integration. The app installs
    `requirements.txt` from PyPI; without the integration it will not start.
 3. Create the app **in the same schema** as the MiniDMS tables. The app uses
-   unqualified names (`document_log`, `@doc_files`, …).
-4. Check: `DESC STREAMLIT <name>` shows the container runtime and a compute pool.
+   unqualified names (`document`, `@doc_files`, …).
+4. Set the app's **query warehouse to `minidms_wh`** (adaptive). The app refuses to run on
+   any other kind of warehouse.
+5. Check: `DESC STREAMLIT <name>` shows the container runtime and a compute pool.
    Open **Diagnostics** as two different users — the *Viewer (actor)* must differ.
 
 In SiS the viewer comes from `st.user.user_name`. `CURRENT_USER()` would return the
@@ -143,7 +160,8 @@ streamlit run streamlit_app.py
 The connection is created with `st.connection("snowflake")`. It reads
 `[connections.snowflake]` from `.streamlit/secrets.toml`, or else your default
 connection in `~/.snowflake/connections.toml`. The connection must set a
-**database and schema** where the MiniDMS objects live.
+**database and schema** where the MiniDMS objects live, and the warehouse
+**`MINIDMS_WH`** (adaptive) — or set `MINIDMS_WAREHOUSE=MINIDMS_WH`.
 
 Optional environment variables:
 
@@ -186,11 +204,11 @@ connection; nobody has to enter credentials.
    ```sql
    CREATE ROLE IF NOT EXISTS MINIDMS_APP;
    CREATE USER IF NOT EXISTS MINIDMS_SVC TYPE = SERVICE
-     DEFAULT_ROLE = MINIDMS_APP DEFAULT_WAREHOUSE = <wh>
+     DEFAULT_ROLE = MINIDMS_APP DEFAULT_WAREHOUSE = MINIDMS_WH
      RSA_PUBLIC_KEY = '<public key without the BEGIN/END lines>';
    GRANT ROLE MINIDMS_APP TO USER MINIDMS_SVC;
    ```
-   Create the objects and grant `MINIDMS_APP` its privileges (Setup steps 2–5).
+   Create the objects and grant `MINIDMS_APP` its privileges (Setup page).
 2. **Secrets.** Paste into *⋮ → Settings → Secrets*. Template:
    [`.streamlit/secrets.community-cloud.toml.example`](.streamlit/secrets.community-cloud.toml.example).
    The Setup page can also generate the `[connections.snowflake]` section for you
@@ -199,8 +217,8 @@ connection; nobody has to enter credentials.
 3. **Login.** With one Snowflake user for everybody, `CURRENT_USER()` cannot tell viewers
    apart. Add Streamlit's login (`[auth]` in the secrets, e.g. Google as OpenID Connect
    provider with the redirect URI `https://<your-app>.streamlit.app/oauth2callback`).
-   The app then records the viewer's login e-mail as the actor, gives each viewer their
-   own `@sessions` folder, and asks for login before it touches Snowflake. List the
+   The app then records the viewer's login e-mail as the actor and asks for login
+   before it touches Snowflake. List the
    people who may run Setup in `MINIDMS_SETUP_USERS`.
 4. **Check.** Log in, open **Diagnostics**: *Viewer (actor)* must be your e-mail and
    `CURRENT_USER()` the service user. Open **Setup**: the progress bar must be full.
@@ -212,8 +230,8 @@ Notes: if your Snowflake account has a network policy, it must allow connections
 Community Cloud. Queries, Cortex text extraction and storage are billed to your Snowflake
 account. Cached data is keyed by account, role, database and schema, so viewers on
 different connections never see each other's cached data; viewers on the same one share
-it. Community Cloud gives an app limited memory, which caps how large the logs can grow
-before you need the reduced view (§9.10).
+it. Community Cloud gives an app limited memory; the cached tables hold current state
+(one row per entity), so this grows with the number of documents, not with edits.
 
 ## Tests
 
@@ -222,99 +240,87 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-The tests need no Snowflake account. They cover the reduction (`latest()` with its
-tie-break), `view()`/`compose()`, `clean_restored()`, column validation, the parquet
-round trip, save-to-session → restore → flush, the interrupted flush that heals
-itself, the layering rules, the setup script parsing and grants, the PEM key
-conversion, the login gate, and smoke tests that render every page (including running
-the setup against an empty schema) with Streamlit's `AppTest` and an in-memory fake
-session.
+The tests need no Snowflake account. The fake session runs on in-memory SQLite with the
+same primary keys as the hybrid tables, so transactions, rollbacks, version conflicts and
+idempotent retries behave for real. They cover the write commands (one transaction per
+action, conflicts, retries, provenance), the change counters and caches, the per-session
+lock, the AI state per file and the suggestions, search, the setup script (it must match
+`core/schema.py` column for column; adaptive-only compute; lineage-friendly
+`INSERT … SELECT`), grants, connection settings, the login and warehouse gates, and the
+real pages driven with Streamlit's `AppTest` — including concurrent edits by two users.
 
 ## Using it
 
 - **Upload** — choose files, a document type, tags and metadata. Each file becomes one
-  document. *Files upload immediately; entries are saved when you click
-  **Save to database**.*
-- **Files** go to `@doc_files/{sha256}/{filename}` at upload time (the name is made
-  path-safe; the original name stays in `document_file_log.filename`). Same content under
-  the same name is stored once. The `document_file_log` row that points to the file waits
-  in your session like every other change.
-- **Text (OCR) is extracted in Snowflake, after Save to database.** The new
-  `document_file_log` rows appear in the stream `document_file_log_stream`; that fires
-  the triggered task `extract_text_task`, which calls `extract_text()`:
-  1. it consumes the stream and queues each new active file without text (`ocr_log`
-     status `queued`);
-  2. for each queued file it reuses the text of an identical file (same checksum) or
-     calls `AI_PARSE_DOCUMENT(TO_FILE('@doc_files', path), {'mode': 'OCR'})`, then
-     appends to `document_text` and `ocr_log` (`done` with page count, `failed` with the
-     error, or `skipped` for file types Cortex does not read: supported are PDF, DOCX,
-     PPTX, JPEG/PNG/TIFF, HTML, TXT).
-
-  The app never calls Cortex. The document's **Text** tab shows the status (*not saved
-  yet*, *waiting*, *queued*, *done*, *failed*, *skipped*); for *failed* or *waiting*
-  files, *Request text extraction again* appends a fresh file row, which goes through
-  the same stream after saving. **Admin → Text extraction** shows the task state,
-  counts, failures and recent runs, and can start a run on demand.
-- **Documents / Search / Trash** — filter in memory by type, tags and text. **Search**
-  asks Snowflake for full-text matches (`SEARCH()` or substring).
-- **Document** — properties, metadata, tags, files (download, add, remove), extracted
-  text, and the full history of the document including unsaved events.
-- The **sidebar** on every page shows your pending changes (saved automatically to your
-  session folder) and the buttons *Save to database* and *Discard changes*. If an
-  automatic save fails, the sidebar says so and it is retried on the next click.
-- **Admin** — your pending rows, everyone's session folders (with cleanup), raw vs.
-  current row counts and memory, orphaned-file scan and cleanup, credit usage.
-- **Diagnostics** — actor, `st.user`, tokens, per-table counts and load times, probe
-  latency, and what is in session state.
+  document and is saved immediately. The bytes go to `@doc_files/{sha256}/{filename}`;
+  same content under the same name is stored once.
+- **AI** — right after the upload, Snowflake runs `process_ai()`: it copies the text of an
+  identical file if there is one, or runs `AI_COMPLETE` on the staged file for the OCR
+  text; then `AI_COMPLETE` with a JSON schema writes a summary, a document-type and tag
+  suggestion and extracted metadata values. File types `AI_COMPLETE` does not read are
+  `skipped`. Lists show the AI state per document; the sidebar says how many files are
+  still being processed.
+- **Document → Text & AI** — the OCR text, the summary and the **suggestions**. Nothing
+  changes until you click *Apply*; the history then records `source = ai:<enrichment id>`.
+  *Process again* asks Snowflake to run the AI again.
+- **Editing** — properties, metadata, tags and files are saved when you click the button
+  next to them. If someone else changed the same thing since your page was drawn, you see
+  *“changed by someone else”*, nothing is written, and the page shows the latest data.
+- **Documents / Search / Trash** — filter in memory by type, tags and text (including the
+  summary). **Search** asks Snowflake for full-text matches in the OCR text and the
+  summaries (`SEARCH()` or substring).
+- **History** — every human edit from `change_log` plus OCR and enrichment events.
+- **Admin** — AI task state, counts, failures, *process unprocessed files*, *run the
+  task now*, recent runs; table sizes; orphaned-file scan and cleanup; credit usage.
+- **Diagnostics** — actor, warehouse type, `st.user`, change counters, cached tables and
+  load times, probe latency.
 
 ## FAQ
 
-**Why can't I delete anything?**
-Every change is an appended event. That makes the history complete, and the audit
-trail comes for free. "Delete" means *trash* (documents), *deactivate* (types, tags),
-*remove* (files, marked inactive) or an empty value (metadata). Trashed documents can
-be restored.
+**Is there a save button?**
+No. Every change is written to Snowflake the moment you make it — one global state.
 
-**Where did my unsaved changes go?**
-Every change is written to `@sessions/<you>/` the moment you make it, and comes back
-automatically when you open the app again (a dialog tells you). After
-*Save to database* the changes are in the tables for everyone, and your session folder
-is emptied.
+**What happens if two people edit the same document?**
+Each row has a version. The second save of the same thing is rejected with a conflict
+message instead of silently overwriting the first; the page then shows the latest data.
+Edits to *different* things (two metadata fields, two tags) do not conflict.
 
-## Known limits (by design)
+**Why can't I delete documents?**
+"Delete" means *trash* (a status, restorable), *deactivate* (types, tags), *remove*
+(files are detached, bytes kept) or an empty value (metadata). Every change is in
+`change_log`, which the app can only append to.
 
-- **Last writer wins on the whole record.** Each edit appends a full snapshot. If two
-  people edit different fields of the same document, the second save overwrites the
-  first.
-- **Several tabs, one user**: all tabs write the same `@sessions/<you>/` folder; each
-  automatic save overwrites that table's file, so the tab that changed a table last
-  wins for that table.
-- Each change costs one small write to `@sessions` (only the tables that changed).
-- Uploaded bytes stay in `@doc_files` even if you discard — clean them up on **Admin**.
-- A document is searchable only after it is saved *and* the task has extracted its text
-  (the Search page says how many are still waiting).
-- Files of other types (e.g. `.md`, `.csv`, `.xlsx`) are stored and downloadable but get
-  no text (`skipped`).
-- No page viewer — use the extracted text and the download button.
+## Known limits
+
+- One point query on `sync_state` per click, plus small loads when something changed.
+- Each write takes a lock on the shared Snowflake session for a few milliseconds, so
+  writes from many simultaneous users queue up briefly.
+- A document is searchable, and has suggestions, only after the AI task has run for it.
+- Writes made outside the app (manual SQL) reach the app's cache only after the TTL
+  (10 minutes) unless they also bump `sync_state`.
+- Uploaded bytes of an interrupted upload stay in `@doc_files` until cleaned up on
+  **Admin**.
+- No page viewer — use the OCR text and the download button.
 - The schema has no link between document types and metadata types, so all active
   metadata types are offered for every document.
-- Logs grow without bound. When the in-memory size (Admin → Log sizes) reaches a few
-  hundred MB, switch the loaders to a reduced server-side view (architecture §9.10).
 
-## Pre-flight checks (from the plan) — to do in your account
+## Pre-flight checks — to do in your account
 
 These could not be verified without a Snowflake account. Please check them once:
 
-1. `create_dataframe` + `save_as_table` round-trip keeps `TIMESTAMP_NTZ` (the app passes
-   an explicit Snowpark schema, so this should hold).
-2. `SYSTEM$LAST_CHANGE_COMMIT_TIME` works on an empty table (the app falls back to
-   `COUNT(*)`/`MAX(event_ts)` if it does not).
-3. `REMOVE @sessions/<user>/` only removes that folder.
-4. `pl.read_parquet` reads what `session.file.get_stream()` returns.
-5. `extract_text()` compiles and works: `CALL extract_text();` after saving one PDF, then
-   `SELECT * FROM ocr_status_v;` (it binds the path into
-   `AI_PARSE_DOCUMENT(TO_FILE('@doc_files', :v_rel), {'mode': 'OCR'})`).
-6. `@st.cache_data` is shared across viewers on the compute pool (check `QUERY_HISTORY`
+1. `CREATE ADAPTIVE WAREHOUSE` is available to your role, and a **triggered task with
+   `WAREHOUSE = minidms_wh`** runs on an adaptive warehouse.
+2. **Hybrid tables** are available in your account/region, and transactions on them run
+   on the adaptive warehouse; the app's `UPDATE … WHERE version = ?` returns the number of
+   rows updated, and a duplicate primary key raises an error mentioning the duplicate key.
+3. `process_ai()` compiles and works: upload one PDF, then check
+   `SELECT * FROM ai_status_v;` and `TABLE(INFORMATION_SCHEMA.TASK_HISTORY(TASK_NAME =>
+   'PROCESS_AI_TASK'))`. In particular the `AI_COMPLETE` calls: `PROMPT(…, TO_FILE(…))`
+   for the OCR and `AI_COMPLETE(model => …, prompt => …, response_format => {…})` for the
+   enrichment.
+4. **Column-level lineage** appears for `document_text.content` (from
+   `stored_file.stage_path`) and the `document_enrichment` columns (from
+   `document_text.content` and the definitions) — in Snowsight's lineage view or
+   `SNOWFLAKE.ACCOUNT_USAGE.ACCESS_HISTORY` (Enterprise edition or higher).
+5. `@st.cache_data` is shared across viewers on the compute pool (check `QUERY_HISTORY`
    after opening the app as two users).
-7. The triggered task fires by itself: save a document, then check
-   `TABLE(INFORMATION_SCHEMA.TASK_HISTORY(TASK_NAME => 'EXTRACT_TEXT_TASK'))`.
