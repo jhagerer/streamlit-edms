@@ -31,9 +31,9 @@ st.json({
     "streamlit": st.__version__,
 })
 
-st.subheader("Change counters")
-st.caption("One point query on the hybrid table sync_state per rerun; every write bumps the "
-           "counters of the tables it touched, and the cached loads are keyed on them.")
+st.subheader("Change tokens")
+st.caption("One query per rerun: the row count of every table. All tables are append-only, so "
+           "a count changes with every commit and never shrinks; the cached loads are keyed on it.")
 st.json(_state.tokens())
 
 st.subheader("Cached tables")
@@ -50,7 +50,7 @@ st.subheader("Probe latency")
 if st.button("Time change_tokens() × 20"):
     ms = read.time_probe(20)
     st.metric("Average per call", f"{ms:.0f} ms",
-              help="The per-interaction latency floor (one point query on a hybrid table).")
+              help="The per-interaction latency floor (row counts of all tables).")
 
 st.subheader("Session state")
 st.caption("No data rows live in session state — the one global state is in Snowflake.")

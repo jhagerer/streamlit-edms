@@ -27,11 +27,12 @@ def test_statements_wait_for_an_open_transaction(fake):
 def test_rollback_on_error(fake):
     try:
         with db.transaction() as tx:
-            tx.run("INSERT INTO sync_state (table_name, seq) VALUES ('x', 1)")
+            tx.run("INSERT INTO ai_job_log (event_id, event_ts, request_id, file_id, document_id, "
+                   "step) VALUES ('x', '2026-01-01', 'r', 'f', 'd', 'queued')")
             raise RuntimeError("boom")
     except RuntimeError:
         pass
-    assert fake.rows("SELECT * FROM sync_state WHERE table_name = 'x'") == []
+    assert fake.count("ai_job_log") == 0
 
 
 def test_duplicate_key_detection():

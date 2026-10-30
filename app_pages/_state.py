@@ -79,14 +79,15 @@ def table(name: str) -> pl.DataFrame:
 
 def files(include_inactive: bool = False) -> pl.DataFrame:
     """Attached files with their stored details and AI state."""
-    return model.files_view(table("document_file"), table("stored_file"),
+    return model.files_view(table("document_file_current"), table("stored_file"),
                             table("ai_status_v"), include_inactive)
 
 
 def document_table() -> pl.DataFrame:
     return model.document_table(
-        table("document"), table("document_type"), files(), table("document_metadata"),
-        table("document_tag"), table("tag"), table("document_enrichment_current"),
+        table("document_current"), table("document_type_current"), files(),
+        table("metadata_current"), table("tag_assignment_current"), table("tag_current"),
+        table("document_enrichment_current"),
     )
 
 

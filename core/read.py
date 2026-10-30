@@ -5,18 +5,18 @@ session; it caches *query results* where that is cheap and safe:
 
 * The current-state tables are small (one row per entity) and are loaded
   whole into polars frames, cached and shared by all viewers.
-* The cache key is the table's change counter from sync_state, which every
-  write bumps in the same transaction. One point query on that hybrid table per
-  rerun tells the app which frames are stale — no invalidation logic anywhere.
-* A TTL is the safety net for writes made outside the app.
+* The cache key is the row count of the tables a frame is built from. Every
+  table is append-only, so a table's count grows with every commit and never
+  shrinks: a perfect change token, even for writes made outside the app, and
+  no counters to maintain. One query per rerun reads all of them.
+* A TTL is an extra safety net.
 
-document_text (large OCR text) and change_log (history) are never bulk-loaded;
-they are queried per document.
+document_text (large OCR text), the search corpus and the history are never
+bulk-loaded; they are queried per document (search: Cortex Search).
 """
 
 from __future__ import annotations
 
-import json
 import time
 
 import polars as pl
@@ -29,7 +29,7 @@ CACHE_TTL = 600  # seconds; safety net for writes made outside the app
 
 _TOKEN_SQL = (
     "SELECT CURRENT_ACCOUNT(), CURRENT_ROLE(), CURRENT_DATABASE(), CURRENT_SCHEMA(), "
-    "(SELECT OBJECT_AGG(table_name, TO_VARIANT(seq)) FROM sync_state)"
+    + ", ".join(f"(SELECT COUNT(*) FROM {t})" for t in TOKEN_TABLES)
 )
 
 
@@ -37,15 +37,12 @@ _TOKEN_SQL = (
 
 
 def change_tokens() -> dict[str, str]:
-    """One round trip: the connection scope plus every table's change counter.
+    """One round trip: the connection scope plus every table's row count.
     Deliberately NOT cached: the screen always matches the database as of
     this rerun. The scope keeps viewers on different connections apart."""
     row = db.query(_TOKEN_SQL)[0]
     scope = "/".join(str(v) for v in row[:4])
-    raw = row[4]
-    seqs = raw if isinstance(raw, dict) else json.loads(raw or "{}")
-    seqs = {str(k).lower(): v for k, v in seqs.items()}
-    return {t: f"{scope}|{seqs.get(t, 0)}" for t in TOKEN_TABLES}
+    return {t: f"{scope}|{row[4 + i]}" for i, t in enumerate(TOKEN_TABLES)}
 
 
 def token_for(name: str, tokens: dict[str, str]) -> str:
@@ -91,12 +88,17 @@ def load_texts(file_ids: tuple[str, ...], token: str) -> pl.DataFrame:
 
 @cache_data(ttl=CACHE_TTL)
 def load_history(document_id: str, token: str) -> pl.DataFrame:
-    """Every human edit of one document, oldest first (index on document_id)."""
+    """Every human change of one document, oldest first."""
     df = db.query_frame(
-        "SELECT * FROM change_log WHERE document_id = ? ORDER BY event_ts, event_id",
+        "SELECT * FROM document_history_v WHERE document_id = ? ORDER BY event_ts",
         params=[document_id],
     )
-    return schema.conform("change_log", df)
+    return schema.conform("document_history_v", df)
+
+
+def history_token(tokens: dict[str, str]) -> str:
+    return "+".join(tokens[t] for t in ("document_log", "document_file_log", "metadata_log",
+                                        "tag_assignment_log"))
 
 
 def load_audit(limit: int = 5000) -> pl.DataFrame:

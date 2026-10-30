@@ -1,9 +1,12 @@
 """Tables, views and pinned dtypes, mirrored from sql/minidms-setup.sql.
 
-Pure: polars only. One global state lives in Snowflake:
+Pure: polars only. One global state lives in Snowflake, and every table is
+append-only:
 
-* hybrid tables — everything people edit (current state, version column);
-* standard tables — immutable facts and AI output (append-only, lineage).
+* hybrid tables — everything people edit; one row per version, the current
+  state is the latest version per key (the *_current views);
+* standard tables — immutable facts and AI output (lineage), plus the search
+  corpus that feeds the Cortex Search service.
 
 Every frame the app loads goes through ``conform()`` so dtypes are pinned in
 one place.
@@ -13,17 +16,15 @@ from __future__ import annotations
 
 import polars as pl
 
-# Human-edited current state. Mutable, one row per entity, version-checked.
+# Human-edited data. Append-only: PRIMARY KEY (key…, version), UNIQUE (event_id).
 HYBRID_TABLES: tuple[str, ...] = (
-    "document_type",
-    "metadata_type",
-    "tag",
-    "document",
-    "document_file",
-    "document_metadata",
-    "document_tag",
-    "change_log",
-    "sync_state",
+    "document_type_log",
+    "metadata_type_log",
+    "tag_log",
+    "document_log",
+    "document_file_log",
+    "metadata_log",
+    "tag_assignment_log",
 )
 
 # Immutable facts and AI output. Append-only; written by INSERT (… SELECT).
@@ -32,33 +33,56 @@ STANDARD_TABLES: tuple[str, ...] = (
     "ai_request",
     "document_text",
     "document_enrichment",
+    "search_corpus",
     "ai_job_log",
 )
 
 VIEWS: tuple[str, ...] = (
+    "document_type_current",
+    "metadata_type_current",
+    "tag_current",
+    "document_current",
+    "document_file_current",
+    "metadata_current",
+    "tag_assignment_current",
     "document_text_current",
     "document_enrichment_current",
     "ai_status_v",
+    "document_history_v",
     "audit_v",
 )
 
-# Tables with a change counter in sync_state (= cache keys).
-TOKEN_TABLES: tuple[str, ...] = tuple(t for t in HYBRID_TABLES if t != "sync_state") + STANDARD_TABLES
+SEARCH_SERVICE = "document_search"
 
-# Tables / views the app bulk-loads (small: one row per entity or per file),
-# with the change counters each one depends on. document_text (the large OCR
-# text) and change_log (history) are never bulk-loaded.
+# Every table's row count is its change token: append-only, so the count
+# grows with every commit and never shrinks.
+TOKEN_TABLES: tuple[str, ...] = HYBRID_TABLES + STANDARD_TABLES
+
+# Views the app bulk-loads (small: one row per entity or per file), with the
+# tables whose change tokens they depend on. document_text (the large OCR text),
+# the search corpus and the history are never bulk-loaded.
 LOADED: dict[str, tuple[str, ...]] = {
-    "document_type": ("document_type",),
-    "metadata_type": ("metadata_type",),
-    "tag": ("tag",),
-    "document": ("document",),
-    "document_file": ("document_file",),
-    "document_metadata": ("document_metadata",),
-    "document_tag": ("document_tag",),
+    "document_type_current": ("document_type_log",),
+    "metadata_type_current": ("metadata_type_log",),
+    "tag_current": ("tag_log",),
+    "document_current": ("document_log",),
+    "document_file_current": ("document_file_log",),
+    "metadata_current": ("metadata_log",),
+    "tag_assignment_current": ("tag_assignment_log",),
     "stored_file": ("stored_file",),
-    "ai_status_v": ("ai_request", "document_text", "document_enrichment"),
+    "ai_status_v": ("ai_request", "document_text", "document_enrichment", "ai_job_log"),
     "document_enrichment_current": ("document_enrichment",),
+}
+
+# Version chains of the hybrid logs: key columns and the record's fields.
+LOG_KEYS: dict[str, tuple[str, ...]] = {
+    "document_type_log": ("document_type_id",),
+    "metadata_type_log": ("metadata_type_id",),
+    "tag_log": ("tag_id",),
+    "document_log": ("document_id",),
+    "document_file_log": ("file_id",),
+    "metadata_log": ("document_id", "metadata_type_id"),
+    "tag_assignment_log": ("document_id", "tag_id"),
 }
 
 TS = pl.Datetime("us")
@@ -66,31 +90,24 @@ S = pl.Utf8
 B = pl.Boolean
 I = pl.Int64
 
-_AUDIT = {"created_at": TS, "created_by": S, "updated_at": TS, "updated_by": S}
+_EVENT = {"version": I, "event_id": S, "event_ts": TS, "actor": S, "op": S}
+_CREATED = {"created_at": TS, "created_by": S, "updated_at": TS, "updated_by": S}
 
 COLUMNS: dict[str, dict[str, pl.DataType]] = {
-    # ── hybrid ──
-    "document_type": {"document_type_id": S, "label": S, "active": B, "version": I, **_AUDIT},
-    "metadata_type": {
-        "metadata_type_id": S, "name": S, "label": S, "data_type": S, "choices": S,
-        "default_value": S, "active": B, "version": I, **_AUDIT,
+    # ── hybrid logs ──
+    "document_type_log": {"document_type_id": S, **_EVENT, "label": S, "active": B, "source": S},
+    "metadata_type_log": {
+        "metadata_type_id": S, **_EVENT, "name": S, "label": S, "data_type": S, "choices": S,
+        "default_value": S, "active": B, "source": S,
     },
-    "tag": {"tag_id": S, "label": S, "color": S, "active": B, "version": I, **_AUDIT},
-    "document": {
-        "document_id": S, "document_type_id": S, "label": S, "description": S, "language": S,
-        "status": S, "version": I, **_AUDIT,
+    "tag_log": {"tag_id": S, **_EVENT, "label": S, "color": S, "active": B, "source": S},
+    "document_log": {
+        "document_id": S, **_EVENT, "document_type_id": S, "label": S, "description": S,
+        "language": S, "status": S, "source": S,
     },
-    "document_file": {"file_id": S, "document_id": S, "active": B, "version": I, **_AUDIT},
-    "document_metadata": {
-        "document_id": S, "metadata_type_id": S, "value": S, "version": I,
-        "updated_at": TS, "updated_by": S,
-    },
-    "document_tag": {"document_id": S, "tag_id": S, "assigned_at": TS, "assigned_by": S},
-    "change_log": {
-        "event_id": S, "event_ts": TS, "actor": S, "entity": S, "entity_id": S,
-        "document_id": S, "op": S, "version": I, "data": S,
-    },
-    "sync_state": {"table_name": S, "seq": I, "changed_at": TS},
+    "document_file_log": {"file_id": S, **_EVENT, "document_id": S, "active": B, "source": S},
+    "metadata_log": {"document_id": S, "metadata_type_id": S, **_EVENT, "value": S, "source": S},
+    "tag_assignment_log": {"document_id": S, "tag_id": S, **_EVENT, "assigned": B, "source": S},
     # ── standard ──
     "stored_file": {
         "file_id": S, "document_id": S, "uploaded_at": TS, "uploaded_by": S, "filename": S,
@@ -109,15 +126,40 @@ COLUMNS: dict[str, dict[str, pl.DataType]] = {
         "model": S, "status": S, "summary": S, "suggested_type_id": S,
         "suggested_tag_ids": S, "extracted_metadata": S, "error": S,   # ARRAYs arrive as JSON text
     },
+    "search_corpus": {
+        "event_id": S, "created_at": TS, "run_id": S, "file_id": S, "document_id": S,
+        "filename": S, "kind": S, "chunk_no": I, "text": S,
+    },
     "ai_job_log": {
         "event_id": S, "event_ts": TS, "request_id": S, "file_id": S, "document_id": S,
         "step": S, "message": S,
     },
     # ── views ──
+    "document_type_current": {"document_type_id": S, "label": S, "active": B, "version": I,
+                              **_CREATED},
+    "metadata_type_current": {
+        "metadata_type_id": S, "name": S, "label": S, "data_type": S, "choices": S,
+        "default_value": S, "active": B, "version": I, **_CREATED,
+    },
+    "tag_current": {"tag_id": S, "label": S, "color": S, "active": B, "version": I, **_CREATED},
+    "document_current": {
+        "document_id": S, "document_type_id": S, "label": S, "description": S, "language": S,
+        "status": S, "version": I, **_CREATED,
+    },
+    "document_file_current": {"file_id": S, "document_id": S, "active": B, "version": I,
+                              **_CREATED},
+    "metadata_current": {"document_id": S, "metadata_type_id": S, "value": S, "version": I,
+                         "updated_at": TS, "updated_by": S},
+    "tag_assignment_current": {"document_id": S, "tag_id": S, "assigned": B, "version": I,
+                               "assigned_at": TS, "assigned_by": S},
     "ai_status_v": {
         "file_id": S, "requested_at": TS, "text_status": S, "text_error": S,
         "extracted_at": TS, "chars": I, "enrich_status": S, "enrich_error": S,
         "enriched_at": TS, "pending": B,
+    },
+    "document_history_v": {
+        "event_ts": TS, "actor": S, "entity": S, "document_id": S, "item_id": S, "op": S,
+        "version": I, "value": S, "source": S,
     },
 }
 COLUMNS["document_text_current"] = COLUMNS["document_text"]

@@ -6,9 +6,9 @@ Streamlit. It runs **in Streamlit in Snowflake** (container runtime), **locally*
 
 Features: upload, immutable content-addressed files with SHA-256 checksums, OCR and AI
 enrichment with `AI_COMPLETE` (summary, document-type and tag suggestions, metadata
-extraction), full-text search, document types, typed metadata, tags, trash, conflict
-detection for concurrent edits, per-document history and an audit trail — with
-column-level lineage for everything the AI produces.
+extraction), semantic and keyword search with **Cortex Search**, document types, typed
+metadata, tags, trash, conflict detection for concurrent edits, per-document history and
+an audit trail — with column-level lineage for everything the AI produces.
 
 Original design: [`docs/09-streamlit-architecture.md`](docs/09-streamlit-architecture.md) ·
 [`docs/10-streamlit-implementation-plan.md`](docs/10-streamlit-implementation-plan.md)
@@ -17,43 +17,53 @@ Schema: [`sql/minidms-setup.sql`](sql/minidms-setup.sql)
 
 ## Architecture
 
-1. **One global state, in Snowflake.** There is no local or per-session copy of any
-   data and no separate save step: every change is written to Snowflake immediately.
-2. **Hybrid tables for everything people edit.** Documents, metadata values, tags, file
-   attachments and the definitions (types, metadata types, tags) are hybrid tables with
-   enforced primary keys and a `version` per row. Each edit is one transaction:
-   - a row in `change_log` — its `event_id` is the **idempotency key** (enforced primary
-     key), so a retried action is rejected as a whole and never applied twice;
-   - the change, `… WHERE version = <the version the user saw>` — if someone else
-     changed it first, nothing is written and the user sees a **conflict** message;
-   - a bump of the touched tables' counters in `sync_state`.
-3. **Standard tables for facts and AI output.** Uploaded files (`stored_file`), AI
-   requests, OCR text and enrichments are append-only standard tables, written by
-   `INSERT … SELECT` inside Snowflake — so Snowflake records **column-level lineage** from
-   the file to the text to the summary and suggestions.
-4. **AI runs in Snowflake, right after the save.** An upload appends to `ai_request`; a
-   stream on it fires a triggered task, which calls `process_ai()`: OCR and enrichment
-   with `AI_COMPLETE` (`claude-sonnet-4-5`). The app never calls Cortex — the AI calls
-   take seconds to minutes and would block the shared Snowflake session for every
-   viewer, and calling it from the app would lose the lineage.
-5. **Any warehouse; adaptive only for bootstrapping.** The app runs on whatever warehouse
+1. **One global state, in Snowflake.** No local or per-session copy of any data and no
+   separate save step: every change is written to Snowflake immediately.
+2. **Every table is append-only — hybrid tables included.** Nothing is ever updated or
+   deleted; the grants enforce it (`SELECT, INSERT` only). The current state is the latest
+   version per key, in the `*_current` views. Removing a metadata value appends
+   `value = NULL`, detaching a tag appends `assigned = FALSE`, trashing appends
+   `status = 'trashed'`.
+3. **Hybrid tables for what people edit** — documents, metadata values, tag assignments,
+   file attachments and the definitions, one row per version. Each user action is one
+   transaction that appends the next version (*the version the user saw + 1*) of every
+   record it touches:
+   - `PRIMARY KEY (id, version)` is enforced: if someone else saved that version first, the
+     insert fails, nothing is written, and the user sees a **conflict** message;
+   - `UNIQUE (event_id)`: a retried action fails the same way, but its `event_id` is already
+     there, so it is reported as **already applied**, never applied twice.
+4. **Standard tables for facts and AI output.** Uploaded files (`stored_file`), AI requests,
+   OCR text, enrichments and the search corpus are append-only standard tables, written by
+   `INSERT … SELECT` inside Snowflake, so Snowflake records **column-level lineage** from the
+   file to the text, the summary, the suggestions and the search chunks.
+5. **The ingest pipeline runs in Snowflake, right after the upload.** An upload appends to
+   `ai_request`; a stream on it fires a triggered task, which calls `process_ai()`:
+   OCR and enrichment with `AI_COMPLETE` (`claude-sonnet-4-5`), then the text is split into
+   chunks (`SPLIT_TEXT_RECURSIVE_CHARACTER`) and appended, with the summary, to
+   `search_corpus`. The app never calls Cortex itself.
+6. **Cortex Search is the sink and the search engine.** The service `document_search`
+   indexes the latest run per file in `search_corpus` (multilingual embedding model,
+   target lag 1 minute). The Search page queries it and gets ranked chunks with
+   `document_id`/`file_id`; type, tag and trash filters run in the app, because those live
+   in the hybrid tables.
+7. **Any warehouse; adaptive only for bootstrapping.** The app runs on whatever warehouse
    the connection (or the Streamlit app) uses. For an empty account, the setup creates the
-   adaptive warehouse `minidms_wh` if it does not exist; the AI task runs on it (change
-   with `ALTER TASK … SET WAREHOUSE`). No serverless tasks.
-6. **Caching where it is cheap and safe.** The current-state tables are small (one row
-   per entity) and are loaded whole into polars frames, cached and shared by all
-   viewers. The cache key is the table's counter in `sync_state`, read with one point
-   query per click; a 10-minute TTL covers writes made outside the app. The large OCR
-   text and the history are queried per document, never bulk-loaded.
+   adaptive warehouse `minidms_wh` if it does not exist; the AI task and the search service
+   run on it. No serverless tasks.
+8. **Caching where it is cheap and safe.** The current-state views are small (one row per
+   entity) and are loaded whole into polars frames, cached and shared by all viewers. The
+   cache key is the **row count** of the tables a frame is built from — append-only means a
+   count changes with every commit and never shrinks, so it also catches writes made
+   outside the app. One query per click reads all counts; a TTL is an extra safety net.
+9. **One lock per shared Snowflake session.** All SQL runs through `core/db.py`, so one
+   viewer's statement can never slip into another viewer's open transaction.
 
-### Where hybrid tables make sense — and where they don't
+### Hybrid or standard?
 
 | Data | Table type | Why |
 |---|---|---|
-| Documents, metadata values, tags, attachments, definitions | **hybrid** | Edited one data point at a time by people; enforced primary keys and row versions give conflict detection instead of last-writer-wins |
-| `change_log` | **hybrid** | Its `event_id` primary key makes every action idempotent; indexed by document for the History tab |
-| `sync_state` | **hybrid** | One point read per click, small point updates on every write — exactly what hybrid tables are fast at |
-| `stored_file`, `ai_request`, `document_text`, `document_enrichment`, `ai_job_log` | standard | Append-only facts written by `INSERT … SELECT`; large text, full-text search and lineage; scans and the result cache work better on standard tables |
+| Documents, metadata values, tag assignments, attachments, definitions | **hybrid**, append-only | Edited one data point at a time by people; enforced `PRIMARY KEY (id, version)` and `UNIQUE (event_id)` give conflict detection and idempotent retries |
+| `stored_file`, `ai_request`, `document_text`, `document_enrichment`, `search_corpus`, `ai_job_log` | standard, append-only | Facts and AI output written by `INSERT … SELECT` — lineage; large text; `search_corpus` is the change-tracked source of the Cortex Search service |
 
 ## Project layout
 
@@ -71,12 +81,12 @@ core/                   plain Python (no Streamlit, except core/session.py)
                         identity, cache decorator
   db.py                 the one place SQL runs: per-session lock, transactions, conflicts
   schema.py             tables, views, pinned dtypes; hybrid vs. standard
-  read.py               change counters (sync_state), cached loads, history, audit
-  write.py              commands: one transaction per action, version checks, change_log
+  read.py               change tokens (row counts), cached loads, history, audit
+  write.py              commands: append the next version, one transaction per action
   files.py              @doc_files upload ({checksum}/{filename}), orphan housekeeping
   ai.py                 AI task state, recent runs, run on demand
   model.py              what the pages show: documents, files + AI state, suggestions
-  search.py             SEARCH() / ILIKE over OCR text and summaries
+  search.py             Cortex Search queries (SEARCH_PREVIEW), ranking, snippets
   setup.py              setup script parsing, grants, schema status checks
   connection.py         connection settings → connector params, secrets.toml, key pairs
 sql/                    setup DDL, grants and deployment
@@ -103,22 +113,24 @@ links to it. It walks through:
 2. **Warehouse, only if missing** — creates the adaptive `minidms_wh` if it does not exist
    (then *Use minidms_wh now* when the session has no warehouse)
 3. **Stage** — `@doc_files`
-4. **Hybrid tables** — the nine tables people edit, plus filling `sync_state`
+4. **Hybrid tables** — the seven append-only logs people edit
 5. **Standard tables** — `stored_file`, `ai_request`, `document_text`,
-   `document_enrichment`, `ai_job_log`
-6. **Views** — latest text / enrichment per file, AI state per file, audit trail
+   `document_enrichment`, `search_corpus`, `ai_job_log`
+6. **Views** — current state per entity, latest text / enrichment per file, AI state per
+   file, per-document history, audit trail
 7. **AI pipeline** — stream `ai_request_stream`, procedure `process_ai()`, triggered task
    `process_ai_task` on `minidms_wh`, and `ALTER TASK … RESUME`
-8. **Grants** (optional) — for an app role: `SELECT, INSERT, UPDATE` on the hybrid
-   tables (plus `DELETE` where removing is the operation: metadata values, tag
-   assignments), `SELECT, INSERT` only on `change_log`, `SELECT` only on the AI output,
-   `USAGE` on `minidms_wh`, `MONITOR, OPERATE` on the task
-9. **PyPI integration** (optional, SiS container runtime; usually ACCOUNTADMIN)
-10. **`CREATE STREAMLIT`** (shown for copying only)
-11. **Starter definitions** (optional) — a few document types, metadata types and tags
+8. **Cortex Search** — the service `document_search` over `search_corpus`
+9. **Grants** (optional) — for an app role: `SELECT, INSERT` on the hybrid logs,
+   `stored_file` and `ai_request`; `SELECT` only on the AI output and `search_corpus`; never
+   `UPDATE` or `DELETE`; `USAGE` on the search service and `minidms_wh`; `MONITOR, OPERATE`
+   on the task
+10. **PyPI integration** (optional, SiS container runtime; usually ACCOUNTADMIN)
+11. **`CREATE STREAMLIT`** (shown for copying only)
+12. **Starter definitions** (optional) — a few document types, metadata types and tags
 
 Every statement is shown before it runs; each has its own *Run* button, and every step
-has *Run all*. A progress bar shows how many of the 25 objects exist (including whether
+has *Run all*. A progress bar shows how many of the 32 objects exist (including whether
 the task is started); a log shows each result.
 
 Who may run the setup statements: on a local run, you; with credentials you entered
@@ -242,65 +254,64 @@ pytest
 ```
 
 The tests need no Snowflake account. The fake session runs on in-memory SQLite with the
-same primary keys as the hybrid tables, so transactions, rollbacks, version conflicts and
-idempotent retries behave for real. They cover the write commands (one transaction per
-action, conflicts, retries, provenance), the change counters and caches, the per-session
-lock, the AI state per file and the suggestions, search, the setup script (it must match
-`core/schema.py` column for column; warehouse bootstrap; lineage-friendly
-`INSERT … SELECT`), grants, connection settings, the login and warehouse gates, and the
-real pages driven with Streamlit's `AppTest` — including concurrent edits by two users.
+same constraints as the hybrid logs (`PRIMARY KEY (id, version)`, `UNIQUE (event_id)`),
+so transactions, rollbacks, version conflicts and idempotent retries behave for real; a
+small stand-in answers Cortex Search queries from `search_corpus`. The tests cover the
+write commands (append-only, conflicts, retries, provenance), the row-count tokens and
+caches, the per-session lock, the AI state per file and the suggestions, Cortex Search
+requests, ranking and literal escaping, the setup script (it must match `core/schema.py`
+column for column, contain no `UPDATE`/`DELETE`, write AI output with `INSERT … SELECT`,
+feed the search service), the grants, connection settings, the login and warehouse gates,
+and the real pages driven with Streamlit's `AppTest` — including concurrent edits.
 
 ## Using it
 
 - **Upload** — choose files, a document type, tags and metadata. Each file becomes one
   document and is saved immediately. The bytes go to `@doc_files/{sha256}/{filename}`;
   same content under the same name is stored once.
-- **AI** — right after the upload, Snowflake runs `process_ai()`: it copies the text of an
-  identical file if there is one, or runs `AI_COMPLETE` on the staged file for the OCR
-  text; then `AI_COMPLETE` with a JSON schema writes a summary, a document-type and tag
-  suggestion and extracted metadata values. File types `AI_COMPLETE` does not read are
-  `skipped`. Lists show the AI state per document; the sidebar says how many files are
-  still being processed.
+- **Ingest pipeline** — right after the upload, Snowflake runs `process_ai()`: OCR with
+  `AI_COMPLETE` (or the text of an identical file), then summary, document-type and tag
+  suggestions and metadata extraction with `AI_COMPLETE` and a JSON schema, then the text
+  chunks and the summary go to `search_corpus`, which Cortex Search indexes. File types
+  `AI_COMPLETE` does not read are `skipped`. Lists show the AI state per document.
 - **Document → Text & AI** — the OCR text, the summary and the **suggestions**. Nothing
-  changes until you click *Apply*; the history then records `source = ai:<enrichment id>`.
-  *Process again* asks Snowflake to run the AI again.
-- **Editing** — properties, metadata, tags and files are saved when you click the button
-  next to them. If someone else changed the same thing since your page was drawn, you see
-  *“changed by someone else”*, nothing is written, and the page shows the latest data.
-- **Documents / Search / Trash** — filter in memory by type, tags and text (including the
-  summary). **Search** asks Snowflake for full-text matches in the OCR text and the
-  summaries (`SEARCH()` or substring).
-- **History** — every human edit from `change_log` plus OCR and enrichment events.
-- **Admin** — AI task state, counts, failures, *process unprocessed files*, *run the
-  task now*, recent runs; table sizes; orphaned-file scan and cleanup; credit usage.
-- **Diagnostics** — actor, warehouse type, `st.user`, change counters, cached tables and
-  load times, probe latency.
+  changes until you click *Apply*; the new version then records `source = ai:<enrichment
+  id>`. *Process again* runs the pipeline again (and re-indexes the file).
+- **Editing** — every change appends a new version. If someone else changed the same thing
+  since your page was drawn, you see *“changed by someone else”*, nothing is written, and
+  the page shows the latest data. Edits to different things do not conflict.
+- **Search** — type a question or keywords; Cortex Search returns the best-matching
+  chunks, the list shows the documents in order of relevance with the best match. Type and
+  tag filters apply on top. New documents are searchable once the pipeline has run and the
+  service has refreshed (target lag 1 minute).
+- **History** — every version of the document's records, plus OCR and enrichment events.
+- **Admin** — AI task state, counts, failures, *process unprocessed files*, *run the task
+  now*, recent runs; table sizes; orphaned-file scan and cleanup; credit usage.
 
 ## FAQ
 
-**Is there a save button?**
-No. Every change is written to Snowflake the moment you make it — one global state.
+**Is there a save button?** No. Every change is written to Snowflake the moment you make it.
 
-**What happens if two people edit the same document?**
-Each row has a version. The second save of the same thing is rejected with a conflict
-message instead of silently overwriting the first; the page then shows the latest data.
-Edits to *different* things (two metadata fields, two tags) do not conflict.
+**Can anything be deleted or overwritten?** No. Every table is append-only, enforced by the
+grants. "Delete" means a new version: *trash* (restorable), *deactivate* (types, tags),
+*remove* (files detached, bytes kept) or an empty value (metadata).
 
-**Why can't I delete documents?**
-"Delete" means *trash* (a status, restorable), *deactivate* (types, tags), *remove*
-(files are detached, bytes kept) or an empty value (metadata). Every change is in
-`change_log`, which the app can only append to.
+**What happens if two people edit the same thing?** Both try to append the same next
+version; the primary key lets only the first one through. The second gets a conflict
+message and sees the latest data.
 
 ## Known limits
 
-- One point query on `sync_state` per click, plus small loads when something changed.
-- Each write takes a lock on the shared Snowflake session for a few milliseconds, so
-  writes from many simultaneous users queue up briefly.
-- A document is searchable, and has suggestions, only after the AI task has run for it.
-- Writes made outside the app (manual SQL) reach the app's cache only after the TTL
-  (10 minutes) unless they also bump `sync_state`.
-- Uploaded bytes of an interrupted upload stay in `@doc_files` until cleaned up on
-  **Admin**.
+- One query per click counts the rows of every table. Cheap at this scale; with very large
+  logs, cache it for a few seconds or switch to `SYSTEM$LAST_CHANGE_COMMIT_TIME`.
+- The `*_current` views pick the latest version per key on every load; the logs grow with
+  every edit. At large volumes, materialise the current state (e.g. a dynamic table).
+- Each write takes a lock on the shared Snowflake session for a few milliseconds, so writes
+  from many simultaneous users queue up briefly.
+- Search results lag the upload by the pipeline run plus the service's target lag.
+- Type, tag and trash filters are applied after the search (the service returns up to 50
+  chunks), so a heavily filtered search can show fewer results than exist.
+- Uploaded bytes of an interrupted upload stay in `@doc_files` until cleaned up on Admin.
 - No page viewer — use the OCR text and the download button.
 - The schema has no link between document types and metadata types, so all active
   metadata types are offered for every document.
@@ -311,16 +322,21 @@ These could not be verified without a Snowflake account. Please check them once:
 
 1. `CREATE ADAPTIVE WAREHOUSE` is available to your role (only needed if `minidms_wh` does
    not exist), and a **triggered task with `WAREHOUSE = minidms_wh`** runs on it.
-2. **Hybrid tables** are available in your account/region; the app's `UPDATE … WHERE version = ?` returns the number of
-   rows updated, and a duplicate primary key raises an error mentioning the duplicate key.
+2. **Hybrid tables** are available in your account/region, with
+   `PRIMARY KEY (…, version)` plus `UNIQUE (event_id)`; a duplicate raises an error that
+   mentions the duplicate key (the app turns it into a conflict or "already applied").
 3. `process_ai()` compiles and works: upload one PDF, then check
-   `SELECT * FROM ai_status_v;` and `TABLE(INFORMATION_SCHEMA.TASK_HISTORY(TASK_NAME =>
-   'PROCESS_AI_TASK'))`. In particular the `AI_COMPLETE` calls: `PROMPT(…, TO_FILE(…))`
-   for the OCR and `AI_COMPLETE(model => …, prompt => …, response_format => {…})` for the
-   enrichment.
-4. **Column-level lineage** appears for `document_text.content` (from
-   `stored_file.stage_path`) and the `document_enrichment` columns (from
-   `document_text.content` and the definitions) — in Snowsight's lineage view or
-   `SNOWFLAKE.ACCOUNT_USAGE.ACCESS_HISTORY` (Enterprise edition or higher).
-5. `@st.cache_data` is shared across viewers on the compute pool (check `QUERY_HISTORY`
+   `SELECT * FROM ai_status_v;`, `SELECT * FROM search_corpus;` and
+   `TABLE(INFORMATION_SCHEMA.TASK_HISTORY(TASK_NAME => 'PROCESS_AI_TASK'))` — in particular
+   the `AI_COMPLETE` calls (`PROMPT(…, TO_FILE(…))`; `model => …, prompt => …,
+   response_format => {…}`) and `SPLIT_TEXT_RECURSIVE_CHARACTER`.
+4. **Cortex Search:** `CREATE CORTEX SEARCH SERVICE … EMBEDDING_MODEL =
+   'snowflake-arctic-embed-l-v2.0'` with a `QUALIFY` in the source query is accepted, and
+   `SNOWFLAKE.CORTEX.SEARCH_PREVIEW('<db>.<schema>.document_search', '{"query": …}')`
+   returns results. For production traffic, Snowflake recommends the Python/REST API of
+   the service; switching `core/search.py` to it is a small change.
+5. **Column-level lineage** appears for `document_text.content`, the `document_enrichment`
+   columns and `search_corpus.text` (Snowsight lineage or
+   `SNOWFLAKE.ACCOUNT_USAGE.ACCESS_HISTORY`, Enterprise edition or higher).
+6. `@st.cache_data` is shared across viewers on the compute pool (check `QUERY_HISTORY`
    after opening the app as two users).

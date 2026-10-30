@@ -62,15 +62,15 @@ def warehouse_gate() -> bool:
 
 
 def document_types(include_inactive: bool = False) -> pl.DataFrame:
-    return model.definitions(_state.table("document_type"), include_inactive)
+    return model.definitions(_state.table("document_type_current"), include_inactive)
 
 
 def metadata_types(include_inactive: bool = False) -> pl.DataFrame:
-    return model.definitions(_state.table("metadata_type"), include_inactive)
+    return model.definitions(_state.table("metadata_type_current"), include_inactive)
 
 
 def tags(include_inactive: bool = False) -> pl.DataFrame:
-    return model.definitions(_state.table("tag"), include_inactive)
+    return model.definitions(_state.table("tag_current"), include_inactive)
 
 
 def label_map(df: pl.DataFrame, key: str) -> dict[str, str]:
@@ -94,14 +94,17 @@ def filter_bar(key: str, show_text: bool = True) -> dict:
     return {"document_type_ids": type_ids, "tag_ids": tag_ids, "text": text}
 
 
-def document_list(docs: pl.DataFrame, key: str, empty_text: str = "No documents.") -> str | None:
-    """Render documents with single-row selection; returns the selected id."""
+def document_list(docs: pl.DataFrame, key: str, empty_text: str = "No documents.",
+                  extra: list[str] | None = None) -> str | None:
+    """Render documents with single-row selection; returns the selected id.
+    ``extra`` columns (e.g. the search match) are shown after the label."""
     if not docs.height:
         st.info(empty_text)
         return None
     shown = docs.select(
         pl.col("ai_state").replace_strict(AI_BADGES, default="").alias("ai"),
         "label",
+        *(extra or []),
         pl.col("document_type").fill_null("—"),
         "tags",
         "files",
@@ -119,6 +122,7 @@ def document_list(docs: pl.DataFrame, key: str, empty_text: str = "No documents.
         column_config={
             "ai": st.column_config.TextColumn("AI", width="small"),
             "label": st.column_config.TextColumn("Label", width="large"),
+            "match": st.column_config.TextColumn("Best match", width="large"),
             "document_type": "Type",
             "tags": st.column_config.ListColumn("Tags"),
             "files": st.column_config.NumberColumn("Files", width="small"),

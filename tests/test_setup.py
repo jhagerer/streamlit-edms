@@ -32,8 +32,8 @@ def test_setup_script_covers_every_object():
         assert {(kind, n) for n in needed} <= names, kind
     assert all(s.kind for s in stmts), [s.sql[:40] for s in stmts if not s.kind]
     assert [st.key for st in setup.steps()] == ["warehouse", "stage", "hybrid", "standard",
-                                                "views", "pipeline"]
-    assert setup.total_needed() == 1 + 1 + 9 + 1 + 5 + 4 + 1 + 1 + 1 + 1
+                                                "views", "pipeline", "search"]
+    assert setup.total_needed() == 1 + 1 + 7 + 6 + 12 + 1 + 1 + 1 + 1 + 1
 
 
 def _columns(sql: str) -> list[str]:
@@ -58,15 +58,20 @@ def test_setup_sql_matches_the_app_schema():
         assert _columns(st.sql) == schema.columns(name), name
 
 
-def test_hybrid_tables_enforce_keys_and_versions():
+def test_every_table_is_append_only():
+    """Hybrid logs: PRIMARY KEY (key…, version) + UNIQUE (event_id). Nothing in
+    the script or the app updates or deletes rows."""
     stmts = {s.name: s.sql for s in setup.setup_statements() if s.kind == "hybrid"}
     for name, sql in stmts.items():
-        assert "PRIMARY KEY" in sql, name
-    for name in ("document_type", "metadata_type", "tag", "document", "document_file",
-                 "document_metadata"):
-        assert "version          NUMBER" in stmts[name] or "version     NUMBER" in stmts[name], name
-    assert "PRIMARY KEY (event_id)" in stmts["change_log"]                 # idempotency key
-    assert "PRIMARY KEY (document_id, tag_id)" in stmts["document_tag"]    # no double attach
+        keys = ", ".join(schema.LOG_KEYS[name])
+        assert f"PRIMARY KEY ({keys}, version)" in sql, name
+        assert "UNIQUE (event_id)" in sql, name
+    text = setup.SETUP_SQL.read_text()
+    code = "\n".join(x.sql for x in setup.setup_statements())
+    assert not re.search(r"\bUPDATE\s+\w+\s+SET\b", code)
+    assert not re.search(r"\bDELETE\s+FROM\b", code)
+    assert not re.search(r"\bMERGE\s+INTO\b", code)
+    assert "sync_state" not in text and "change_log" not in text
 
 
 def test_setup_creates_an_adaptive_warehouse_only_if_missing():
@@ -103,12 +108,31 @@ def test_pipeline_is_triggered_and_lineage_friendly():
     assert ocr.index("AI_COMPLETE(") < ocr.index("FROM stored_file f")
     enrich = proc[proc.index("INSERT INTO document_enrichment"):]
     assert enrich.index("AI_COMPLETE(") < enrich.index("FROM document_text_current t")
-    # Only standard tables and the counters are written by the procedure.
-    assert "UPDATE sync_state" in proc
-    assert re.findall(r"UPDATE (\w+)", proc) == ["sync_state"] and "DELETE " not in proc
+    # The procedure only appends to standard tables.
+    written = set(re.findall(r"INSERT INTO (\w+)", proc))
+    assert written == {"ai_job_log", "document_text", "document_enrichment", "search_corpus"}
+    assert written <= set(schema.STANDARD_TABLES)
+    # The sink: text chunks and the summary go to search_corpus by INSERT … SELECT.
+    sink = proc[proc.index("INSERT INTO search_corpus"):]
+    assert "SPLIT_TEXT_RECURSIVE_CHARACTER" in sink and sink.index("SELECT") < sink.index(
+        "FROM document_text_current t")
     order = [(s.kind, s.name) for s in stmts]
     assert order.index(("table", "ai_request")) < order.index(("stream", "ai_request_stream"))
     assert order.index(("task", "process_ai_task")) < order.index(("resume", "process_ai_task"))
+
+
+def test_cortex_search_service_is_the_sink():
+    by = {(s.kind, s.name): s.sql for s in setup.setup_statements()}
+    svc = by[("search", "document_search")]
+    assert svc.startswith("CREATE CORTEX SEARCH SERVICE IF NOT EXISTS document_search")
+    assert "ON text" in svc and "ATTRIBUTES document_id, file_id, kind" in svc
+    assert "WAREHOUSE = minidms_wh" in svc and "TARGET_LAG = '1 minute'" in svc
+    assert "FROM search_corpus" in svc
+    # Its source is a standard table with change tracking, written only by process_ai().
+    corpus = by[("table", "search_corpus")]
+    assert "CHANGE_TRACKING = TRUE" in corpus
+    order = [(s.kind, s.name) for s in setup.setup_statements()]
+    assert order.index(("table", "search_corpus")) < order.index(("search", "document_search"))
 
 
 def test_no_file_bytes_in_tables_and_no_session_stage():
@@ -128,17 +152,20 @@ def test_missing():
     assert got["hybrid"] == [] and got["table"] == [] and got["view"] == []
 
 
-def test_grants_follow_the_data_model():
+def test_grants_enforce_append_only():
     grants = [g.sql for g in setup.grant_statements("MINIDMS_APP", "DB", "S")]
+    sql = " ".join(grants)
+    assert "UPDATE" not in sql and "DELETE" not in sql            # append-only, enforced
     by_table = {g.split(" ON ")[1].split(" TO ")[0].split(".")[-1]: g for g in grants
                 if " ON TABLE " in g}
-    assert "GRANT USAGE ON WAREHOUSE MINIDMS_WH TO ROLE MINIDMS_APP" in grants
-    assert by_table["document"].startswith("GRANT SELECT, INSERT, UPDATE ON")
-    assert "DELETE" not in by_table["document"]                      # trash is a status
-    assert by_table["change_log"].startswith("GRANT SELECT, INSERT ON")   # history: append-only
-    assert by_table["document_text"].startswith("GRANT SELECT ON")   # AI output: read-only
-    assert by_table["document_enrichment"].startswith("GRANT SELECT ON")
     assert set(by_table) == set(schema.HYBRID_TABLES) | set(schema.STANDARD_TABLES)
+    for t in schema.HYBRID_TABLES + ("stored_file", "ai_request"):
+        assert by_table[t].startswith("GRANT SELECT, INSERT ON"), t
+    for t in ("document_text", "document_enrichment", "search_corpus", "ai_job_log"):
+        assert by_table[t].startswith("GRANT SELECT ON"), t     # written only by process_ai()
+    assert 'GRANT USAGE ON CORTEX SEARCH SERVICE "DB"."S".document_search TO ROLE MINIDMS_APP' \
+        in grants
+    assert "GRANT USAGE ON WAREHOUSE MINIDMS_WH TO ROLE MINIDMS_APP" in grants
     with pytest.raises(ValueError):
         setup.grant_statements("x; DROP DATABASE y", "DB", "S")
     with pytest.raises(ValueError):

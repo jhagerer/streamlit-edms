@@ -135,8 +135,9 @@ for i, step in enumerate(schema_steps, start=2):
 n = len(schema_steps) + 2
 st.header(f"{n} · Grants for the app role (optional)")
 st.caption("Only needed when the app runs with a role that does not own the objects. "
-           "Grants SELECT and INSERT but no UPDATE or DELETE, so the database enforces "
-           "append-only. Needs a role that may grant these privileges.")
+           "Grants SELECT and INSERT (no UPDATE or DELETE anywhere), so the database enforces "
+           "that every table is append-only, plus USAGE on the Cortex Search service. Needs a "
+           "role that may grant these privileges.")
 c1, c2 = st.columns(2)
 role = c1.text_input("App role", placeholder="MINIDMS_APP")
 wh = c2.text_input("Warehouse to grant", value=ctx["warehouse"] or "")

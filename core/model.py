@@ -1,8 +1,10 @@
-"""What the pages show, built from the loaded tables. Pure polars; no I/O.
+"""What the pages show, built from the loaded views. Pure polars; no I/O.
 
-The tables already hold current state (hybrid tables are updated in place;
-the views pick the latest AI result per file), so this module only joins and
-filters.
+Every table is append-only; the *_current views already pick the latest
+version per key, so this module only joins and filters. Removed metadata
+values (value NULL) and detached tags/files (assigned/active FALSE) stay in
+those views — their version is needed for the next edit — and are filtered
+out here.
 """
 
 from __future__ import annotations
@@ -82,13 +84,14 @@ def document_table(docs: pl.DataFrame, types: pl.DataFrame, files: pl.DataFrame,
         pl.col("ai_state").alias("_states"),
     )
     tag_agg = (
-        doc_tags.join(tags.select("tag_id", pl.col("label").alias("tag_label"),
+        doc_tags.filter(pl.col("assigned"))
+        .join(tags.select("tag_id", pl.col("label").alias("tag_label"),
                                   pl.col("active").alias("tag_active")), on="tag_id", how="left")
         .filter(pl.col("tag_active").fill_null(True))
         .group_by("document_id")
         .agg(pl.col("tag_id").alias("tag_ids"), pl.col("tag_label").sort().alias("tags"))
     )
-    meta_agg = doc_meta.group_by("document_id").agg(
+    meta_agg = doc_meta.filter(pl.col("value").is_not_null()).group_by("document_id").agg(
         pl.col("value").str.join(" ").alias("metadata_text"))
     summary = (
         enrich.filter(pl.col("status") == "done")
@@ -139,6 +142,19 @@ def filter_documents(table: pl.DataFrame, text: str = "", document_type_ids: lis
         ).str.to_lowercase()
         out = out.filter(hay.str.contains(text, literal=True))
     return out
+
+
+def metadata_values(doc_meta: pl.DataFrame, document_id: str) -> dict[str, dict]:
+    """metadata_type_id -> current row of one document, including removed
+    values (value None) because their version is needed for the next edit."""
+    return {r["metadata_type_id"]: r for r in
+            doc_meta.filter(pl.col("document_id") == document_id).iter_rows(named=True)}
+
+
+def tag_versions(doc_tags: pl.DataFrame, document_id: str) -> dict[str, tuple[int, bool]]:
+    """tag_id -> (version, assigned) of every tag chain of one document."""
+    return {r["tag_id"]: (r["version"], bool(r["assigned"])) for r in
+            doc_tags.filter(pl.col("document_id") == document_id).iter_rows(named=True)}
 
 
 def suggestions(enrichment: dict | None, document: dict, tag_ids: list[str],

@@ -25,19 +25,39 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core import schema  # noqa: E402
 
-PRIMARY_KEYS = {
-    "document_type": ["document_type_id"],
-    "metadata_type": ["metadata_type_id"],
-    "tag": ["tag_id"],
-    "document": ["document_id"],
-    "document_file": ["file_id"],
-    "document_metadata": ["document_id", "metadata_type_id"],
-    "document_tag": ["document_id", "tag_id"],
-    "change_log": ["event_id"],
-    "sync_state": ["table_name"],
-}
+def _current(table: str, key: str, cols: str, created: bool = True) -> str:
+    created_cols = (f", (SELECT event_ts FROM {table} f WHERE {_eq(key, 'f')} AND f.version = 1) "
+                    f"AS created_at, (SELECT actor FROM {table} f WHERE {_eq(key, 'f')} "
+                    f"AND f.version = 1) AS created_by, event_ts AS updated_at, "
+                    f"actor AS updated_by") if created else ""
+    return (f"SELECT {cols}, version{created_cols} FROM {table} l WHERE version = "
+            f"(SELECT MAX(version) FROM {table} m WHERE {_eq(key, 'm')})")
+
+
+def _eq(key: str, alias: str) -> str:
+    return " AND ".join(f"{alias}.{k} = l.{k}" for k in key.split(","))
+
 
 VIEWS_SQL = [
+    "CREATE VIEW document_type_current AS " + _current(
+        "document_type_log", "document_type_id", "document_type_id, label, active"),
+    "CREATE VIEW metadata_type_current AS " + _current(
+        "metadata_type_log", "metadata_type_id",
+        "metadata_type_id, name, label, data_type, choices, default_value, active"),
+    "CREATE VIEW tag_current AS " + _current("tag_log", "tag_id", "tag_id, label, color, active"),
+    "CREATE VIEW document_current AS " + _current(
+        "document_log", "document_id",
+        "document_id, document_type_id, label, description, language, status"),
+    "CREATE VIEW document_file_current AS " + _current(
+        "document_file_log", "file_id", "file_id, document_id, active"),
+    "CREATE VIEW metadata_current AS " + _current(
+        "metadata_log", "document_id,metadata_type_id",
+        "document_id, metadata_type_id, value, event_ts AS updated_at, actor AS updated_by",
+        created=False),
+    "CREATE VIEW tag_assignment_current AS " + _current(
+        "tag_assignment_log", "document_id,tag_id",
+        "document_id, tag_id, assigned, event_ts AS assigned_at, actor AS assigned_by",
+        created=False),
     """CREATE VIEW document_text_current AS SELECT * FROM (
          SELECT *, ROW_NUMBER() OVER (PARTITION BY file_id ORDER BY extracted_at DESC, event_id DESC) AS rn
          FROM document_text) WHERE rn = 1""",
@@ -45,15 +65,31 @@ VIEWS_SQL = [
          SELECT *, ROW_NUMBER() OVER (PARTITION BY file_id ORDER BY created_at DESC, event_id DESC) AS rn
          FROM document_enrichment) WHERE rn = 1""",
     """CREATE VIEW ai_status_v AS
-       WITH r AS (SELECT file_id, MAX(requested_at) AS requested_at FROM ai_request GROUP BY file_id)
+       WITH r AS (SELECT * FROM (SELECT file_id, event_id AS request_id, requested_at,
+                  ROW_NUMBER() OVER (PARTITION BY file_id ORDER BY requested_at DESC, event_id DESC) AS rn
+                  FROM ai_request) WHERE rn = 1)
        SELECT r.file_id, r.requested_at, t.status AS text_status, t.error AS text_error,
               t.extracted_at, LENGTH(t.content) AS chars, e.status AS enrich_status,
               e.error AS enrich_error, e.created_at AS enriched_at,
-              (e.created_at IS NULL OR e.created_at < r.requested_at) AS pending
+              NOT EXISTS (SELECT 1 FROM ai_job_log j WHERE j.request_id = r.request_id
+                          AND j.step = 'finished') AS pending
        FROM r LEFT JOIN document_text_current t ON t.file_id = r.file_id
               LEFT JOIN document_enrichment_current e ON e.file_id = r.file_id""",
+    """CREATE VIEW document_history_v AS
+       SELECT event_ts, actor, 'document' AS entity, document_id, NULL AS item_id, op, version,
+              label AS value, source FROM document_log
+       UNION ALL SELECT event_ts, actor, 'file', document_id, file_id, op, version, NULL, source
+       FROM document_file_log
+       UNION ALL SELECT event_ts, actor, 'metadata', document_id, metadata_type_id, op, version,
+              value, source FROM metadata_log
+       UNION ALL SELECT event_ts, actor, 'tag', document_id, tag_id, op, version, NULL, source
+       FROM tag_assignment_log""",
     """CREATE VIEW audit_v AS
-       SELECT event_ts, actor, op, entity, document_id, entity_id AS object_id FROM change_log
+       SELECT event_ts, actor, op, entity, document_id, COALESCE(item_id, document_id) AS object_id
+       FROM document_history_v
+       UNION ALL SELECT event_ts, actor, op, 'document_type', NULL, document_type_id FROM document_type_log
+       UNION ALL SELECT event_ts, actor, op, 'metadata_type', NULL, metadata_type_id FROM metadata_type_log
+       UNION ALL SELECT event_ts, actor, op, 'tag_definition', NULL, tag_id FROM tag_log
        UNION ALL SELECT uploaded_at, uploaded_by, 'upload', 'stored_file', document_id, file_id FROM stored_file
        UNION ALL SELECT extracted_at, actor, 'ocr_' || status, 'document_text', NULL, file_id FROM document_text
        UNION ALL SELECT created_at, actor, 'enrich_' || status, 'document_enrichment', document_id, file_id
@@ -69,15 +105,16 @@ def _sql_type(dtype) -> str:
 
 
 def create_schema(conn: sqlite3.Connection) -> None:
+    """Same constraints as sql/minidms-setup.sql: hybrid logs get
+    PRIMARY KEY (key…, version) and UNIQUE (event_id)."""
     for table in schema.HYBRID_TABLES + schema.STANDARD_TABLES:
         cols = [f"{c} {_sql_type(t)}" for c, t in schema.COLUMNS[table].items()]
-        if table in PRIMARY_KEYS:
-            cols.append(f"PRIMARY KEY ({', '.join(PRIMARY_KEYS[table])})")
+        if table in schema.LOG_KEYS:
+            cols.append(f"PRIMARY KEY ({', '.join(schema.LOG_KEYS[table])}, version)")
+            cols.append("UNIQUE (event_id)")
         conn.execute(f"CREATE TABLE {table} ({', '.join(cols)})")
     for sql in VIEWS_SQL:
         conn.execute(sql)
-    conn.executemany("INSERT INTO sync_state (table_name, seq) VALUES (?, 0)",
-                     [(t,) for t in schema.TOKEN_TABLES])
 
 
 def _param(v):
@@ -131,9 +168,25 @@ class FakeSession:
         self.closed = False
         self.task_state = "started"
         self.warehouse_type = "ADAPTIVE"
+        self.search_requests: list[dict] = []
 
     def close(self):
         self.closed = True
+
+    def _search_preview(self, q: str) -> str:
+        """Stand-in for Cortex Search: words of the query matched against the
+        latest run per file in search_corpus, best (most words) first."""
+        m = re.search(r"SEARCH_PREVIEW\('(.*?)', '(.*)'\)$", q, re.S)
+        request = json.loads(m.group(2).replace("''", "'").replace("\\\\", "\\"))
+        self.search_requests.append(request)
+        rows = self.rows("SELECT * FROM search_corpus c WHERE run_id = (SELECT run_id FROM "
+                         "search_corpus d WHERE d.file_id = c.file_id ORDER BY created_at DESC "
+                         "LIMIT 1)")
+        words = [w.lower() for w in request["query"].split()]
+        scored = [(sum(w in (r["text"] or "").lower() for w in words), r) for r in rows]
+        hits = [r for n, r in sorted(scored, key=lambda x: -x[0]) if n]
+        return json.dumps({"results": [{c: r[c] for c in request["columns"]}
+                                       for r in hits[:request["limit"]]]})
 
     # ── helpers for tests ──
     def rows(self, sql: str, params=()) -> list[dict]:
@@ -144,9 +197,6 @@ class FakeSession:
     def count(self, table: str) -> int:
         return self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
 
-    def seq(self, table: str) -> int:
-        return self.conn.execute("SELECT seq FROM sync_state WHERE table_name = ?",
-                                 [table]).fetchone()[0]
 
     # ── Snowpark surface ──
     def sql(self, query, params=None):
@@ -163,11 +213,13 @@ class FakeSession:
         if up in ("COMMIT", "ROLLBACK"):
             self.conn.execute(up)
             return _Result([])
-        if up.startswith("SELECT CURRENT_ACCOUNT(), CURRENT_ROLE()") and "OBJECT_AGG" in up:
+        if up.startswith("SELECT CURRENT_ACCOUNT(), CURRENT_ROLE()") and "COUNT(*)" in up:
             if self.schema_missing:
-                raise RuntimeError("Object 'SYNC_STATE' does not exist")
-            seqs = dict(self.conn.execute("SELECT table_name, seq FROM sync_state").fetchall())
-            return _Result([("ACCT", "ROLE", "DB", "SCHEMA", json.dumps(seqs))])
+                raise RuntimeError("Object 'DOCUMENT_LOG' does not exist")
+            counts = [self.count(t) for t in re.findall(r"FROM (\w+)\)", q)]
+            return _Result([("ACCT", "ROLE", "DB", "SCHEMA", *counts)])
+        if "SNOWFLAKE.CORTEX.SEARCH_PREVIEW" in up:
+            return _Result([(self._search_preview(q),)])
         if up.startswith("SELECT CURRENT_") and "FROM" not in up:
             return _Result([tuple(_CURRENT[n] for n in re.findall(r"CURRENT_(\w+)\(\)", up))])
         if up.startswith("SHOW WAREHOUSES"):
@@ -178,6 +230,8 @@ class FakeSession:
                                 warehouse="MINIDMS_WH")])
         if up.startswith("SHOW STREAMS"):
             return _Result([] if self.schema_missing else [Row(name="AI_REQUEST_STREAM")])
+        if up.startswith("SHOW CORTEX SEARCH SERVICES"):
+            return _Result([] if self.schema_missing else [Row(name="DOCUMENT_SEARCH")])
         if up.startswith("SHOW HYBRID TABLES"):
             return _Result([] if self.schema_missing else
                            [Row(name=t.upper()) for t in schema.HYBRID_TABLES])

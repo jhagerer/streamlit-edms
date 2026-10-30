@@ -1,34 +1,41 @@
 -- ─────────────────────────────────────────────────────────────────────────────
 -- MiniDMS — setup
 --
--- Everything the app needs: a warehouse (created only if missing), one stage, nine hybrid
--- tables, five standard tables, four views, and the AI pipeline (one stream,
--- one procedure, one triggered task). Run once in the database and schema you
--- already use.
+-- Everything the app needs: a warehouse (created only if missing), one stage,
+-- seven hybrid tables, six standard tables, a dozen views, the AI pipeline (one
+-- stream, one procedure, one triggered task) and one Cortex Search service.
+-- Run once in the database and schema you already use.
 --
--- One global state, in Snowflake only. There is no local or per-session copy:
--- every change in the app is written straight to these tables.
+-- One global state, in Snowflake only, and EVERY table is append-only — the
+-- hybrid tables too. Nothing is ever updated or deleted; the current state is
+-- the latest version per key (the *_current views).
 --
 --   Hybrid tables   — everything people edit, one data point at a time
---                     (documents, metadata values, tags, definitions). Enforced
---                     primary keys make ids unique; a version column per row
---                     lets the app detect concurrent edits ("changed by someone
---                     else") instead of overwriting them. change_log keeps the
---                     full history, with event_id as an enforced primary key so
---                     a retried write can never be applied twice.
+--                     (documents, metadata values, tag assignments, file
+--                     attachments, definitions). Each change appends the next
+--                     version of the record. PRIMARY KEY (id, version) makes
+--                     concurrent edits collide: two users saving version n+1 of
+--                     the same record — the second insert fails and the app
+--                     reports a conflict. UNIQUE (event_id) makes a retried
+--                     action fail as a whole, so it is never applied twice.
 --   Standard tables — immutable facts and AI output: uploaded files, AI
---                     requests, OCR text, enrichments. Written only by INSERT
---                     (… SELECT …), so Snowflake records column-level lineage
---                     from the file to the text to the summary/suggestions.
+--                     requests, OCR text, enrichments and the search corpus.
+--                     Written by INSERT … SELECT inside Snowflake, so Snowflake
+--                     records column-level lineage from the file to the text to
+--                     the summary, suggestions and search chunks.
+--   Cortex Search   — the sink of the ingest pipeline: it indexes the search
+--                     corpus that process_ai() writes, and the Search page
+--                     queries it.
 --
--- Idempotent. Tables and the stream use IF NOT EXISTS so re-running never drops
--- data or resets the stream offset; views, the procedure and the task use
--- OR REPLACE because they hold no state (the ALTER TASK … RESUME at the end
--- starts the task again).
+-- Idempotent. Tables, the stream and the search service use IF NOT EXISTS so
+-- re-running never drops data, resets the stream offset or rebuilds the index;
+-- views, the procedure and the task use OR REPLACE because they hold no state
+-- (the ALTER TASK … RESUME at the end starts the task again).
 --
--- Privileges the owning role needs: CREATE WAREHOUSE (account), CREATE TABLE /
--- VIEW / STAGE / STREAM / TASK / PROCEDURE (schema), EXECUTE TASK (account) and
--- the SNOWFLAKE.CORTEX_USER database role (AI_COMPLETE).
+-- Privileges the owning role needs: CREATE WAREHOUSE (account, only if
+-- minidms_wh does not exist), CREATE TABLE / HYBRID TABLE / VIEW / STAGE /
+-- STREAM / TASK / PROCEDURE / CORTEX SEARCH SERVICE (schema), EXECUTE TASK
+-- (account) and the SNOWFLAKE.CORTEX_USER database role.
 -- ─────────────────────────────────────────────────────────────────────────────
 
 -- USE DATABASE <yours>;
@@ -36,13 +43,13 @@
 
 -- ── Warehouse ────────────────────────────────────────────────────────────────
 
--- Bootstrap only: in an empty account there is nothing to run queries or the AI
--- task on, so the setup creates one — adaptive, so there is no size to pick.
--- IF NOT EXISTS: an existing minidms_wh is left as it is. The app itself runs on
--- any warehouse (the connection's or the Streamlit app's QUERY_WAREHOUSE); the
--- AI task below uses minidms_wh (change with ALTER TASK … SET WAREHOUSE).
+-- Bootstrap only: in an empty account there is nothing to run queries, the AI
+-- task or the search service on, so the setup creates one — adaptive, so there
+-- is no size to pick. IF NOT EXISTS: an existing minidms_wh is left as it is.
+-- The app itself runs on any warehouse (the connection's or the Streamlit
+-- app's QUERY_WAREHOUSE).
 CREATE ADAPTIVE WAREHOUSE IF NOT EXISTS minidms_wh
-    COMMENT = 'MiniDMS: created by the setup; runs the AI task';
+    COMMENT = 'MiniDMS: created by the setup; runs the AI task and the search service';
 
 -- ── Stage ────────────────────────────────────────────────────────────────────
 
@@ -56,141 +63,125 @@ CREATE STAGE IF NOT EXISTS doc_files
     ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE')
     COMMENT    = 'Immutable uploaded document files';
 
--- ── Hybrid tables: human-edited state ────────────────────────────────────────
+-- ── Hybrid tables: human-edited state, append-only ───────────────────────────
 --
--- Current state, one row per entity. Every edit runs as one transaction:
--- insert into change_log (event_id PK) + update the row WHERE version = the
--- version the user saw + bump sync_state. If the version no longer matches,
--- nothing is written and the app reports a conflict.
+-- One row per version. Every edit is one transaction that appends the next
+-- version (the user's version + 1) of each record it touches, with the full
+-- record, who and when. No UPDATE, no DELETE: removing a metadata value
+-- appends value = NULL, detaching a tag appends assigned = FALSE, trashing a
+-- document appends status = 'trashed'. `source` records provenance, e.g.
+-- 'ai:<enrichment event_id>' when a user applies an AI suggestion.
 
-CREATE HYBRID TABLE IF NOT EXISTS document_type (
+CREATE HYBRID TABLE IF NOT EXISTS document_type_log (
     document_type_id VARCHAR       NOT NULL,
+    version          NUMBER        NOT NULL,
+    event_id         VARCHAR       NOT NULL,   -- client-generated per action
+    event_ts         TIMESTAMP_NTZ NOT NULL,
+    actor            VARCHAR       NOT NULL,   -- viewer (st.user / login e-mail)
+    op               VARCHAR       NOT NULL,   -- create | update
     label            VARCHAR       NOT NULL,
-    active           BOOLEAN       NOT NULL DEFAULT TRUE,
-    version          NUMBER        NOT NULL DEFAULT 1,
-    created_at       TIMESTAMP_NTZ NOT NULL,
-    created_by       VARCHAR       NOT NULL,
-    updated_at       TIMESTAMP_NTZ NOT NULL,
-    updated_by       VARCHAR       NOT NULL,
-    PRIMARY KEY (document_type_id)
-)   COMMENT = 'Document types. Human-edited; version = optimistic lock.';
+    active           BOOLEAN       NOT NULL,
+    source           VARCHAR,
+    PRIMARY KEY (document_type_id, version),
+    UNIQUE (event_id)
+)   COMMENT = 'Append-only. Document types; latest version per id is current.';
 
-CREATE HYBRID TABLE IF NOT EXISTS metadata_type (
+CREATE HYBRID TABLE IF NOT EXISTS metadata_type_log (
     metadata_type_id VARCHAR       NOT NULL,
+    version          NUMBER        NOT NULL,
+    event_id         VARCHAR       NOT NULL,
+    event_ts         TIMESTAMP_NTZ NOT NULL,
+    actor            VARCHAR       NOT NULL,
+    op               VARCHAR       NOT NULL,   -- create | update
     name             VARCHAR       NOT NULL,   -- machine name
     label            VARCHAR       NOT NULL,
     data_type        VARCHAR       NOT NULL,   -- text | number | date | choice
     choices          VARCHAR,                  -- newline-separated
     default_value    VARCHAR,
-    active           BOOLEAN       NOT NULL DEFAULT TRUE,
-    version          NUMBER        NOT NULL DEFAULT 1,
-    created_at       TIMESTAMP_NTZ NOT NULL,
-    created_by       VARCHAR       NOT NULL,
-    updated_at       TIMESTAMP_NTZ NOT NULL,
-    updated_by       VARCHAR       NOT NULL,
-    PRIMARY KEY (metadata_type_id)
-)   COMMENT = 'Typed metadata fields. Human-edited; version = optimistic lock.';
+    active           BOOLEAN       NOT NULL,
+    source           VARCHAR,
+    PRIMARY KEY (metadata_type_id, version),
+    UNIQUE (event_id)
+)   COMMENT = 'Append-only. Typed metadata fields; latest version per id is current.';
 
-CREATE HYBRID TABLE IF NOT EXISTS tag (
+CREATE HYBRID TABLE IF NOT EXISTS tag_log (
     tag_id      VARCHAR       NOT NULL,
+    version     NUMBER        NOT NULL,
+    event_id    VARCHAR       NOT NULL,
+    event_ts    TIMESTAMP_NTZ NOT NULL,
+    actor       VARCHAR       NOT NULL,
+    op          VARCHAR       NOT NULL,        -- create | update
     label       VARCHAR       NOT NULL,
     color       VARCHAR(7),                    -- #rrggbb
-    active      BOOLEAN       NOT NULL DEFAULT TRUE,
-    version     NUMBER        NOT NULL DEFAULT 1,
-    created_at  TIMESTAMP_NTZ NOT NULL,
-    created_by  VARCHAR       NOT NULL,
-    updated_at  TIMESTAMP_NTZ NOT NULL,
-    updated_by  VARCHAR       NOT NULL,
-    PRIMARY KEY (tag_id)
-)   COMMENT = 'Tags. Human-edited; version = optimistic lock.';
+    active      BOOLEAN       NOT NULL,
+    source      VARCHAR,
+    PRIMARY KEY (tag_id, version),
+    UNIQUE (event_id)
+)   COMMENT = 'Append-only. Tags; latest version per id is current.';
 
-CREATE HYBRID TABLE IF NOT EXISTS document (
+CREATE HYBRID TABLE IF NOT EXISTS document_log (
     document_id      VARCHAR       NOT NULL,   -- uuid4, client-generated
+    version          NUMBER        NOT NULL,
+    event_id         VARCHAR       NOT NULL,
+    event_ts         TIMESTAMP_NTZ NOT NULL,
+    actor            VARCHAR       NOT NULL,
+    op               VARCHAR       NOT NULL,   -- create | update | trash | restore
     document_type_id VARCHAR,
     label            VARCHAR,
     description      VARCHAR,
     language         VARCHAR(8),
-    status           VARCHAR       NOT NULL DEFAULT 'active',  -- active | trashed
-    version          NUMBER        NOT NULL DEFAULT 1,
-    created_at       TIMESTAMP_NTZ NOT NULL,
-    created_by       VARCHAR       NOT NULL,
-    updated_at       TIMESTAMP_NTZ NOT NULL,
-    updated_by       VARCHAR       NOT NULL,
-    PRIMARY KEY (document_id)
-)   COMMENT = 'Documents. Human-edited; version = optimistic lock.';
+    status           VARCHAR       NOT NULL,   -- active | trashed
+    source           VARCHAR,
+    PRIMARY KEY (document_id, version),
+    UNIQUE (event_id)
+)   COMMENT = 'Append-only. Documents; latest version per id is current.';
 
 -- Which files belong to a document, and whether they are still attached.
 -- The file itself (name, size, checksum, stage path) is in stored_file.
-CREATE HYBRID TABLE IF NOT EXISTS document_file (
+CREATE HYBRID TABLE IF NOT EXISTS document_file_log (
     file_id     VARCHAR       NOT NULL,
-    document_id VARCHAR       NOT NULL,
-    active      BOOLEAN       NOT NULL DEFAULT TRUE,
-    version     NUMBER        NOT NULL DEFAULT 1,
-    created_at  TIMESTAMP_NTZ NOT NULL,
-    created_by  VARCHAR       NOT NULL,
-    updated_at  TIMESTAMP_NTZ NOT NULL,
-    updated_by  VARCHAR       NOT NULL,
-    PRIMARY KEY (file_id),
-    INDEX document_file_document_idx (document_id)
-)   COMMENT = 'File attachments. Human-edited; version = optimistic lock.';
-
--- One row per (document, field) that has a value. Removing a value deletes the
--- row; the history is in change_log.
-CREATE HYBRID TABLE IF NOT EXISTS document_metadata (
-    document_id      VARCHAR       NOT NULL,
-    metadata_type_id VARCHAR       NOT NULL,
-    value            VARCHAR       NOT NULL,
-    version          NUMBER        NOT NULL DEFAULT 1,
-    updated_at       TIMESTAMP_NTZ NOT NULL,
-    updated_by       VARCHAR       NOT NULL,
-    PRIMARY KEY (document_id, metadata_type_id)
-)   COMMENT = 'Metadata values. Human-edited; version = optimistic lock.';
-
--- One row per attached tag; detaching deletes the row. The primary key makes a
--- double attach impossible.
-CREATE HYBRID TABLE IF NOT EXISTS document_tag (
-    document_id VARCHAR       NOT NULL,
-    tag_id      VARCHAR       NOT NULL,
-    assigned_at TIMESTAMP_NTZ NOT NULL,
-    assigned_by VARCHAR       NOT NULL,
-    PRIMARY KEY (document_id, tag_id)
-)   COMMENT = 'Tag assignments. Human-edited.';
-
--- Append-only history of every human edit, written in the same transaction as
--- the edit. event_id is client-generated per action: a retried action hits the
--- primary key and is rejected as a whole, so it can never be applied twice.
-CREATE HYBRID TABLE IF NOT EXISTS change_log (
+    version     NUMBER        NOT NULL,
     event_id    VARCHAR       NOT NULL,
     event_ts    TIMESTAMP_NTZ NOT NULL,
-    actor       VARCHAR       NOT NULL,       -- viewer (st.user / login e-mail)
-    entity      VARCHAR       NOT NULL,       -- document | document_file | document_metadata | …
-    entity_id   VARCHAR       NOT NULL,
-    document_id VARCHAR,                      -- set for document-scoped changes
-    op          VARCHAR       NOT NULL,       -- create | update | trash | restore | delete | attach | detach
-    version     NUMBER,                       -- row version after the change
-    data        VARCHAR,                      -- JSON of the new values
-    PRIMARY KEY (event_id),
-    INDEX change_log_document_idx (document_id)
-)   COMMENT = 'Append-only history of human edits. event_id = idempotency key.';
+    actor       VARCHAR       NOT NULL,
+    op          VARCHAR       NOT NULL,        -- attach | detach
+    document_id VARCHAR       NOT NULL,
+    active      BOOLEAN       NOT NULL,
+    source      VARCHAR,
+    PRIMARY KEY (file_id, version),
+    UNIQUE (event_id),
+    INDEX document_file_log_document_idx (document_id)
+)   COMMENT = 'Append-only. File attachments; latest version per file is current.';
 
--- Change counters, one row per table. Every write bumps the rows of the tables
--- it touched (in the same transaction for hybrid writes). The app reads all of
--- them in one point query per click and uses them as cache keys.
-CREATE HYBRID TABLE IF NOT EXISTS sync_state (
-    table_name  VARCHAR       NOT NULL,
-    seq         NUMBER        NOT NULL DEFAULT 0,
-    changed_at  TIMESTAMP_NTZ,
-    PRIMARY KEY (table_name)
-)   COMMENT = 'Per-table change counters; cache keys for the app.';
+-- One version chain per (document, field). value = NULL means removed.
+CREATE HYBRID TABLE IF NOT EXISTS metadata_log (
+    document_id      VARCHAR       NOT NULL,
+    metadata_type_id VARCHAR       NOT NULL,
+    version          NUMBER        NOT NULL,
+    event_id         VARCHAR       NOT NULL,
+    event_ts         TIMESTAMP_NTZ NOT NULL,
+    actor            VARCHAR       NOT NULL,
+    op               VARCHAR       NOT NULL,   -- set | remove
+    value            VARCHAR,
+    source           VARCHAR,
+    PRIMARY KEY (document_id, metadata_type_id, version),
+    UNIQUE (event_id)
+)   COMMENT = 'Append-only. Metadata values; latest version per (document, field) is current.';
 
-INSERT INTO sync_state (table_name, seq, changed_at)
-SELECT n.table_name, 0, SYSDATE()
-FROM (SELECT column1 AS table_name FROM VALUES
-        ('document_type'), ('metadata_type'), ('tag'), ('document'),
-        ('document_file'), ('document_metadata'), ('document_tag'), ('change_log'),
-        ('stored_file'), ('ai_request'), ('document_text'), ('document_enrichment'),
-        ('ai_job_log')) n
-WHERE n.table_name NOT IN (SELECT table_name FROM sync_state);
+-- One version chain per (document, tag). assigned = FALSE means detached.
+CREATE HYBRID TABLE IF NOT EXISTS tag_assignment_log (
+    document_id VARCHAR       NOT NULL,
+    tag_id      VARCHAR       NOT NULL,
+    version     NUMBER        NOT NULL,
+    event_id    VARCHAR       NOT NULL,
+    event_ts    TIMESTAMP_NTZ NOT NULL,
+    actor       VARCHAR       NOT NULL,
+    op          VARCHAR       NOT NULL,        -- attach | detach
+    assigned    BOOLEAN       NOT NULL,
+    source      VARCHAR,
+    PRIMARY KEY (document_id, tag_id, version),
+    UNIQUE (event_id)
+)   COMMENT = 'Append-only. Tag assignments; latest version per (document, tag) is current.';
 
 -- ── Standard tables: immutable facts and AI output ───────────────────────────
 
@@ -207,8 +198,8 @@ CREATE TABLE IF NOT EXISTS stored_file (
     checksum    VARCHAR(64)                   -- sha256 hex
 )   COMMENT = 'Append-only. Uploaded files; bytes live in @doc_files.';
 
--- A request to run OCR + enrichment for a file: written at upload and when a
--- user asks to process a file again. The stream on this table fires the task.
+-- A request to run the ingest pipeline for a file: written at upload and when
+-- a user asks to process a file again. The stream on this table fires the task.
 CREATE TABLE IF NOT EXISTS ai_request (
     event_id     VARCHAR       NOT NULL,
     requested_at TIMESTAMP_NTZ NOT NULL,
@@ -249,6 +240,21 @@ CREATE TABLE IF NOT EXISTS document_enrichment (
     error              VARCHAR
 )   COMMENT = 'Append-only. AI enrichment per file; latest row per file_id wins.';
 
+-- The sink of the ingest pipeline and the source of the Cortex Search service:
+-- the OCR text split into chunks, plus the summary, per processing run.
+CREATE TABLE IF NOT EXISTS search_corpus (
+    event_id    VARCHAR       NOT NULL,
+    created_at  TIMESTAMP_NTZ NOT NULL,
+    run_id      VARCHAR       NOT NULL,       -- the ai_request it came from
+    file_id     VARCHAR       NOT NULL,
+    document_id VARCHAR       NOT NULL,
+    filename    VARCHAR,
+    kind        VARCHAR       NOT NULL,       -- text | summary
+    chunk_no    NUMBER        NOT NULL,       -- -1 for the summary
+    text        VARCHAR
+)   CHANGE_TRACKING = TRUE
+    COMMENT = 'Append-only. Searchable chunks; indexed by the document_search service.';
+
 -- What process_ai() did: one row when a request is taken from the stream
 -- (queued) and one when it is finished.
 CREATE TABLE IF NOT EXISTS ai_job_log (
@@ -261,7 +267,63 @@ CREATE TABLE IF NOT EXISTS ai_job_log (
     message     VARCHAR
 )   COMMENT = 'Append-only. AI processing log.';
 
--- ── Views ────────────────────────────────────────────────────────────────────
+-- ── Views: current state ─────────────────────────────────────────────────────
+--
+-- The latest version per key, with who created it and who changed it last.
+-- Removed values and detached tags/files stay visible here (with their
+-- version), because the next edit must append version + 1.
+
+CREATE OR REPLACE VIEW document_type_current AS
+SELECT document_type_id, label, active, version,
+       FIRST_VALUE(event_ts) OVER (PARTITION BY document_type_id ORDER BY version) AS created_at,
+       FIRST_VALUE(actor)    OVER (PARTITION BY document_type_id ORDER BY version) AS created_by,
+       event_ts AS updated_at, actor AS updated_by
+FROM document_type_log
+QUALIFY ROW_NUMBER() OVER (PARTITION BY document_type_id ORDER BY version DESC) = 1;
+
+CREATE OR REPLACE VIEW metadata_type_current AS
+SELECT metadata_type_id, name, label, data_type, choices, default_value, active, version,
+       FIRST_VALUE(event_ts) OVER (PARTITION BY metadata_type_id ORDER BY version) AS created_at,
+       FIRST_VALUE(actor)    OVER (PARTITION BY metadata_type_id ORDER BY version) AS created_by,
+       event_ts AS updated_at, actor AS updated_by
+FROM metadata_type_log
+QUALIFY ROW_NUMBER() OVER (PARTITION BY metadata_type_id ORDER BY version DESC) = 1;
+
+CREATE OR REPLACE VIEW tag_current AS
+SELECT tag_id, label, color, active, version,
+       FIRST_VALUE(event_ts) OVER (PARTITION BY tag_id ORDER BY version) AS created_at,
+       FIRST_VALUE(actor)    OVER (PARTITION BY tag_id ORDER BY version) AS created_by,
+       event_ts AS updated_at, actor AS updated_by
+FROM tag_log
+QUALIFY ROW_NUMBER() OVER (PARTITION BY tag_id ORDER BY version DESC) = 1;
+
+CREATE OR REPLACE VIEW document_current AS
+SELECT document_id, document_type_id, label, description, language, status, version,
+       FIRST_VALUE(event_ts) OVER (PARTITION BY document_id ORDER BY version) AS created_at,
+       FIRST_VALUE(actor)    OVER (PARTITION BY document_id ORDER BY version) AS created_by,
+       event_ts AS updated_at, actor AS updated_by
+FROM document_log
+QUALIFY ROW_NUMBER() OVER (PARTITION BY document_id ORDER BY version DESC) = 1;
+
+CREATE OR REPLACE VIEW document_file_current AS
+SELECT file_id, document_id, active, version,
+       FIRST_VALUE(event_ts) OVER (PARTITION BY file_id ORDER BY version) AS created_at,
+       FIRST_VALUE(actor)    OVER (PARTITION BY file_id ORDER BY version) AS created_by,
+       event_ts AS updated_at, actor AS updated_by
+FROM document_file_log
+QUALIFY ROW_NUMBER() OVER (PARTITION BY file_id ORDER BY version DESC) = 1;
+
+CREATE OR REPLACE VIEW metadata_current AS
+SELECT document_id, metadata_type_id, value, version,
+       event_ts AS updated_at, actor AS updated_by
+FROM metadata_log
+QUALIFY ROW_NUMBER() OVER (PARTITION BY document_id, metadata_type_id ORDER BY version DESC) = 1;
+
+CREATE OR REPLACE VIEW tag_assignment_current AS
+SELECT document_id, tag_id, assigned, version,
+       event_ts AS assigned_at, actor AS assigned_by
+FROM tag_assignment_log
+QUALIFY ROW_NUMBER() OVER (PARTITION BY document_id, tag_id ORDER BY version DESC) = 1;
 
 CREATE OR REPLACE VIEW document_text_current
     COMMENT = 'Latest OCR result per file.'
@@ -277,12 +339,16 @@ SELECT *
 FROM document_enrichment
 QUALIFY ROW_NUMBER() OVER (PARTITION BY file_id ORDER BY created_at DESC, event_id DESC) = 1;
 
--- AI state per file: pending while the newest request is newer than the newest
--- enrichment row (process_ai() always writes one, also when OCR failed).
+-- AI state per file: pending while the newest request has no 'finished' entry
+-- in ai_job_log yet.
 CREATE OR REPLACE VIEW ai_status_v
     COMMENT = 'AI processing state per file.'
 AS
-WITH r AS (SELECT file_id, MAX(requested_at) AS requested_at FROM ai_request GROUP BY file_id)
+WITH r AS (
+    SELECT file_id, event_id AS request_id, requested_at
+    FROM ai_request
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY file_id ORDER BY requested_at DESC, event_id DESC) = 1
+)
 SELECT r.file_id,
        r.requested_at,
        t.status                    AS text_status,
@@ -292,19 +358,37 @@ SELECT r.file_id,
        e.status                    AS enrich_status,
        e.error                     AS enrich_error,
        e.created_at                AS enriched_at,
-       (e.created_at IS NULL OR e.created_at < r.requested_at) AS pending
+       NOT EXISTS (SELECT 1 FROM ai_job_log j
+                   WHERE j.request_id = r.request_id AND j.step = 'finished') AS pending
 FROM r
 LEFT JOIN document_text_current       t ON t.file_id = r.file_id
 LEFT JOIN document_enrichment_current e ON e.file_id = r.file_id;
 
--- History is the data: human edits from change_log, plus uploads and AI output.
+-- Every human change of one document, for the History tab.
+CREATE OR REPLACE VIEW document_history_v
+    COMMENT = 'Human changes per document, from the append-only logs.'
+AS
+          SELECT event_ts, actor, 'document' AS entity, document_id, NULL AS item_id, op,
+                 version, label AS value, source FROM document_log
+UNION ALL SELECT event_ts, actor, 'file', document_id, file_id, op, version, NULL, source
+          FROM document_file_log
+UNION ALL SELECT event_ts, actor, 'metadata', document_id, metadata_type_id, op, version, value,
+                 source FROM metadata_log
+UNION ALL SELECT event_ts, actor, 'tag', document_id, tag_id, op, version, NULL, source
+          FROM tag_assignment_log;
+
+-- History is the data: every log, plus uploads and AI output.
 CREATE OR REPLACE VIEW audit_v
     COMMENT = 'Unified history: human edits, uploads, AI processing.'
 AS
-          SELECT event_ts,     actor,       op,                  entity,                document_id, entity_id AS object_id FROM change_log
-UNION ALL SELECT uploaded_at,  uploaded_by, 'upload',            'stored_file',         document_id, file_id                FROM stored_file
-UNION ALL SELECT extracted_at, actor,       'ocr_' || status,    'document_text',       NULL,        file_id                FROM document_text
-UNION ALL SELECT created_at,   actor,       'enrich_' || status, 'document_enrichment', document_id, file_id                FROM document_enrichment;
+          SELECT event_ts, actor, op, entity, document_id, COALESCE(item_id, document_id) AS object_id
+          FROM document_history_v
+UNION ALL SELECT event_ts, actor, op, 'document_type', NULL, document_type_id FROM document_type_log
+UNION ALL SELECT event_ts, actor, op, 'metadata_type', NULL, metadata_type_id FROM metadata_type_log
+UNION ALL SELECT event_ts, actor, op, 'tag_definition', NULL, tag_id FROM tag_log
+UNION ALL SELECT uploaded_at,  uploaded_by, 'upload',            'stored_file',         document_id, file_id FROM stored_file
+UNION ALL SELECT extracted_at, actor,       'ocr_' || status,    'document_text',       NULL,        file_id FROM document_text
+UNION ALL SELECT created_at,   actor,       'enrich_' || status, 'document_enrichment', document_id, file_id FROM document_enrichment;
 
 -- ── AI pipeline: stream + procedure + triggered task ─────────────────────────
 --
@@ -317,9 +401,12 @@ UNION ALL SELECT created_at,   actor,       'enrich_' || status, 'document_enric
 --         AI_COMPLETE on the staged file, as INSERT … SELECT FROM stored_file;
 --      b. enrichment — AI_COMPLETE with a JSON schema over the text and the
 --         current definitions, as INSERT … SELECT FROM document_text;
---      c. log 'finished' and bump sync_state so the app reloads.
+--      c. sink — split the text into chunks (SPLIT_TEXT_RECURSIVE_CHARACTER)
+--         and append them plus the summary to search_corpus, which the
+--         Cortex Search service indexes;
+--      d. log 'finished'.
 --   One failing file never blocks the others: it gets 'failed' rows with the
---   error message. Model: claude-sonnet-4-5.
+--   error message. Model: claude-sonnet-4-5. Only INSERTs: append-only.
 
 CREATE STREAM IF NOT EXISTS ai_request_stream
     ON TABLE ai_request
@@ -329,7 +416,7 @@ CREATE STREAM IF NOT EXISTS ai_request_stream
 CREATE OR REPLACE PROCEDURE process_ai()
     RETURNS VARCHAR
     LANGUAGE SQL
-    COMMENT = 'OCR and enrichment with AI_COMPLETE for queued AI requests.'
+    COMMENT = 'OCR, enrichment (AI_COMPLETE) and search corpus for queued AI requests.'
     EXECUTE AS OWNER
 AS
 $$
@@ -423,14 +510,14 @@ BEGIN
                                || 'listed. Only use ids from the lists.'
                                || '\nDOCUMENT_TYPES: ' || COALESCE((SELECT ARRAY_AGG(OBJECT_CONSTRUCT(
                                       'id', document_type_id, 'label', label))::VARCHAR
-                                      FROM document_type WHERE active), '[]')
+                                      FROM document_type_current WHERE active), '[]')
                                || '\nTAGS: ' || COALESCE((SELECT ARRAY_AGG(OBJECT_CONSTRUCT(
                                       'id', tag_id, 'label', label))::VARCHAR
-                                      FROM tag WHERE active), '[]')
+                                      FROM tag_current WHERE active), '[]')
                                || '\nMETADATA_TYPES: ' || COALESCE((SELECT ARRAY_AGG(OBJECT_CONSTRUCT(
                                       'id', metadata_type_id, 'label', label, 'data_type', data_type,
                                       'choices', choices))::VARCHAR
-                                      FROM metadata_type WHERE active), '[]')
+                                      FROM metadata_type_current WHERE active), '[]')
                                || '\nDOCUMENT TEXT:\n' || LEFT(t.content, 100000),
                            response_format => {
                                'type': 'json',
@@ -473,11 +560,35 @@ BEGIN
                 v_failed := v_failed + 1;
         END;
 
-        -- 2c. Done: log it and tell the app.
-        INSERT INTO ai_job_log (event_id, event_ts, request_id, file_id, document_id, step)
-        SELECT UUID_STRING(), SYSDATE(), :v_req, :v_fid, :v_doc, 'finished';
-        UPDATE sync_state SET seq = seq + 1, changed_at = SYSDATE()
-        WHERE table_name IN ('document_text', 'document_enrichment', 'ai_job_log');
+        -- 2c. Sink: chunks of the OCR text plus the summary go to search_corpus,
+        --     the source of the Cortex Search service. One generation per run
+        --     (run_id); the service indexes only the latest run per file.
+        BEGIN
+            INSERT INTO search_corpus (event_id, created_at, run_id, file_id, document_id,
+                                       filename, kind, chunk_no, text)
+            SELECT UUID_STRING(), SYSDATE(), :v_req, t.file_id, f.document_id, f.filename,
+                   'text', c.index, c.value::VARCHAR
+            FROM document_text_current t
+            JOIN stored_file f ON f.file_id = t.file_id,
+                 LATERAL FLATTEN(input => SNOWFLAKE.CORTEX.SPLIT_TEXT_RECURSIVE_CHARACTER(
+                     t.content, 'none', 1500, 200)) c
+            WHERE t.file_id = :v_fid AND t.status = 'done' AND LENGTH(t.content) > 0
+            UNION ALL
+            SELECT UUID_STRING(), SYSDATE(), :v_req, e.file_id, e.document_id, f.filename,
+                   'summary', -1, e.summary
+            FROM document_enrichment_current e
+            JOIN stored_file f ON f.file_id = e.file_id
+            WHERE e.file_id = :v_fid AND e.status = 'done' AND e.summary IS NOT NULL;
+        EXCEPTION
+            WHEN OTHER THEN
+                v_msg := SQLERRM;
+                v_failed := v_failed + 1;
+        END;
+
+        -- 2d. Done.
+        INSERT INTO ai_job_log (event_id, event_ts, request_id, file_id, document_id, step, message)
+        SELECT UUID_STRING(), SYSDATE(), :v_req, :v_fid, :v_doc, 'finished', :v_msg;
+        v_msg := NULL;
     END FOR;
     RETURN v_done || ' processed, ' || v_failed || ' failed';
 END;
@@ -493,6 +604,26 @@ AS
 
 -- Tasks are created suspended.
 ALTER TASK process_ai_task RESUME;
+
+-- ── Cortex Search: the sink of the ingest pipeline ───────────────────────────
+--
+-- Indexes the latest processing run of every file in search_corpus and keeps
+-- itself up to date (TARGET_LAG). Hybrid keyword + semantic search; the
+-- multilingual embedding model handles German and English documents. The
+-- attributes come back with every hit; type, tag and trash filters are applied
+-- in the app (they live in hybrid tables).
+CREATE CORTEX SEARCH SERVICE IF NOT EXISTS document_search
+    ON text
+    ATTRIBUTES document_id, file_id, kind
+    WAREHOUSE = minidms_wh
+    TARGET_LAG = '1 minute'
+    EMBEDDING_MODEL = 'snowflake-arctic-embed-l-v2.0'
+    COMMENT = 'MiniDMS full-text and semantic search over OCR text and summaries'
+AS (
+    SELECT text, document_id, file_id, filename, kind, chunk_no
+    FROM search_corpus
+    QUALIFY run_id = FIRST_VALUE(run_id) OVER (PARTITION BY file_id ORDER BY created_at DESC)
+);
 
 -- ── Later, if needed ─────────────────────────────────────────────────────────
 -- Housekeeping, when it starts to matter rather than now:

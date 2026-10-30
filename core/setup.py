@@ -12,26 +12,28 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from core import db
-from core.schema import HYBRID_TABLES, STANDARD_TABLES, TOKEN_TABLES
+from core.schema import HYBRID_TABLES, STANDARD_TABLES
+from core.schema import VIEWS as SCHEMA_VIEWS
 
 SETUP_SQL = Path(__file__).resolve().parents[1] / "sql" / "minidms-setup.sql"
 
 _IDENT = re.compile(r'^(?:[A-Za-z_][A-Za-z0-9_$]*|"[^"]+")$')
 _CREATE = re.compile(
-    r"^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(ADAPTIVE\s+WAREHOUSE|HYBRID\s+TABLE|STAGE|TABLE|VIEW|"
-    r"STREAM|PROCEDURE|TASK)\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_][\w$]*)",
+    r"^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(ADAPTIVE\s+WAREHOUSE|HYBRID\s+TABLE|CORTEX\s+SEARCH\s+SERVICE|"
+    r"STAGE|TABLE|VIEW|STREAM|PROCEDURE|TASK)\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_][\w$]*)",
     re.IGNORECASE,
 )
-_SEED = re.compile(r"^\s*INSERT\s+INTO\s+(sync_state)\b", re.IGNORECASE)
-_KIND = {"adaptive warehouse": "warehouse", "hybrid table": "hybrid"}
+_KIND = {"adaptive warehouse": "warehouse", "hybrid table": "hybrid",
+         "cortex search service": "search"}
 _RESUME = re.compile(r"^\s*ALTER\s+TASK\s+([A-Za-z_][\w$]*)\s+RESUME\b", re.IGNORECASE)
 
 WAREHOUSES = ("minidms_wh",)
 STAGES = ("doc_files",)
-VIEWS = ("document_text_current", "document_enrichment_current", "ai_status_v", "audit_v")
+VIEWS = SCHEMA_VIEWS
 STREAMS = ("ai_request_stream",)
 PROCEDURES = ("process_ai",)
 TASKS = ("process_ai_task",)
+SEARCH_SERVICES = ("document_search",)
 
 
 @dataclass
@@ -39,7 +41,7 @@ class Statement:
     sql: str
     kind: str | None = None      # warehouse | stage | hybrid | table | view | stream
                                  # | procedure | task | resume (ALTER TASK … RESUME)
-                                 # | seed (INSERT INTO sync_state) | None
+                                 # | search (Cortex Search service) | None
     name: str | None = None      # object name, lower case
 
 
@@ -112,9 +114,6 @@ def classify(sql: str) -> Statement:
     if m:
         kind = re.sub(r"\s+", " ", m.group(1).lower())
         return Statement(sql, _KIND.get(kind, kind), m.group(2).lower())
-    m = _SEED.match(sql)
-    if m:
-        return Statement(sql, "seed", m.group(1).lower())
     m = _RESUME.match(sql)
     if m:
         return Statement(sql, "resume", m.group(1).lower())
@@ -135,31 +134,15 @@ def quote(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
-# Hybrid tables people edit: which DML the app needs on each.
-_HYBRID_GRANTS = {
-    "document_type": "SELECT, INSERT, UPDATE",
-    "metadata_type": "SELECT, INSERT, UPDATE",
-    "tag": "SELECT, INSERT, UPDATE",
-    "document": "SELECT, INSERT, UPDATE",
-    "document_file": "SELECT, INSERT, UPDATE",
-    "document_metadata": "SELECT, INSERT, UPDATE, DELETE",
-    "document_tag": "SELECT, INSERT, DELETE",
-    "change_log": "SELECT, INSERT",          # history: append-only, enforced here
-    "sync_state": "SELECT, UPDATE",
-}
-_STANDARD_GRANTS = {
-    "stored_file": "SELECT, INSERT",
-    "ai_request": "SELECT, INSERT",
-    "document_text": "SELECT",              # written only by process_ai()
-    "document_enrichment": "SELECT",
-    "ai_job_log": "SELECT",
-}
+# Standard tables the app itself appends to; the rest are written by process_ai().
+APP_APPENDED = ("stored_file", "ai_request")
 
 
 def grant_statements(role: str, database: str, schema: str,
                      warehouse: str | None = "MINIDMS_WH") -> list[Statement]:
     """Privileges for the app's role: what it exercises and nothing more.
-    ``database``/``schema`` come from the session context.
+    Every table is append-only, and the grants enforce it: SELECT and INSERT,
+    never UPDATE or DELETE. ``database``/``schema`` come from the session.
 
     AI processing runs as the *owner* of the task and procedure, so the
     Cortex privilege belongs to the owning role, not here."""
@@ -173,9 +156,13 @@ def grant_statements(role: str, database: str, schema: str,
     if warehouse:
         stmts.append(f"GRANT USAGE ON WAREHOUSE {warehouse} TO ROLE {role}")
     stmts += [f"GRANT READ, WRITE ON STAGE {sch}.{s} TO ROLE {role}" for s in STAGES]
-    stmts += [f"GRANT {p} ON TABLE {sch}.{t} TO ROLE {role}" for t, p in _HYBRID_GRANTS.items()]
-    stmts += [f"GRANT {p} ON TABLE {sch}.{t} TO ROLE {role}" for t, p in _STANDARD_GRANTS.items()]
+    stmts += [f"GRANT SELECT, INSERT ON TABLE {sch}.{t} TO ROLE {role}"
+              for t in HYBRID_TABLES + APP_APPENDED]
+    stmts += [f"GRANT SELECT ON TABLE {sch}.{t} TO ROLE {role}"   # written only by process_ai()
+              for t in STANDARD_TABLES if t not in APP_APPENDED]
     stmts += [f"GRANT SELECT ON VIEW {sch}.{v} TO ROLE {role}" for v in VIEWS]
+    stmts += [f"GRANT USAGE ON CORTEX SEARCH SERVICE {sch}.{s} TO ROLE {role}"
+              for s in SEARCH_SERVICES]
     # Lets the Admin page show the task and start a run on demand.
     stmts += [f"GRANT MONITOR, OPERATE ON TASK {sch}.{t} TO ROLE {role}" for t in TASKS]
     return [Statement(s) for s in stmts]
@@ -224,29 +211,35 @@ def steps(text: str | None = None) -> list[Step]:
              "`@doc_files` holds uploaded files at `{checksum}/{filename}` (with a directory "
              "table and server-side encryption, which AI_COMPLETE needs to read them).",
              by_kind("stage")),
-        Step("hybrid", "Hybrid tables (what people edit)",
-             "Documents, metadata values, tags, file attachments and the definitions: current "
-             "state with enforced primary keys and a version column per row, so concurrent "
-             "edits are detected instead of overwritten. `change_log` keeps the history "
-             "(its event_id primary key makes every action idempotent); `sync_state` holds the "
-             "change counters the app uses as cache keys. The last statement fills it.",
-             by_kind("hybrid", "seed")),
-        Step("standard", "Standard tables (files and AI output)",
-             "Uploaded files, AI requests, OCR text and enrichments: append-only and written "
-             "by INSERT … SELECT inside Snowflake, so they carry column-level lineage.",
+        Step("hybrid", "Hybrid tables (what people edit, append-only)",
+             "Documents, metadata values, tag assignments, file attachments and the "
+             "definitions. One row per version — nothing is updated or deleted. "
+             "PRIMARY KEY (id, version) makes concurrent edits collide instead of overwriting "
+             "each other; UNIQUE (event_id) makes every action idempotent.",
+             by_kind("hybrid")),
+        Step("standard", "Standard tables (files, AI output, search corpus)",
+             "Uploaded files, AI requests, OCR text, enrichments and the search corpus: "
+             "append-only and written by INSERT … SELECT inside Snowflake, so they carry "
+             "column-level lineage.",
              by_kind("table")),
         Step("views", "Views",
-             "Latest OCR text and enrichment per file, AI state per file, and the audit trail. "
+             "The current state (latest version per key), the latest OCR text and enrichment "
+             "per file, the AI state per file, the per-document history and the audit trail. "
              "`OR REPLACE` is safe — views hold no data.",
              by_kind("view")),
         Step("pipeline", "AI pipeline (stream + triggered task)",
              "A stream on `ai_request` fires the triggered task on `minidms_wh` right after a "
-             "file is uploaded; it calls `process_ai()`, which runs AI_COMPLETE "
-             "(claude-sonnet-4-5) for OCR, summary, type and tag suggestions and metadata "
-             "extraction. The owning role needs CREATE STREAM/TASK/PROCEDURE, EXECUTE TASK, "
-             "USAGE on the warehouse and SNOWFLAKE.CORTEX_USER. The last statement resumes the "
-             "task (tasks are created suspended).",
+             "file is uploaded; it calls `process_ai()`: AI_COMPLETE (claude-sonnet-4-5) for "
+             "OCR, summary, type and tag suggestions and metadata extraction, then the text "
+             "chunks and summary go to `search_corpus`. The owning role needs CREATE "
+             "STREAM/TASK/PROCEDURE, EXECUTE TASK, USAGE on the warehouse and "
+             "SNOWFLAKE.CORTEX_USER. The last statement resumes the task.",
              by_kind("stream", "procedure", "task", "resume")),
+        Step("search", "Cortex Search (the sink of the pipeline)",
+             "The service `document_search` indexes the latest run of every file in "
+             "`search_corpus` and refreshes itself (target lag 1 minute). The Search page "
+             "queries it. Needs CREATE CORTEX SEARCH SERVICE and CORTEX_USER.",
+             by_kind("search")),
     ]
     if other:
         out.append(Step("other", "Other statements", "Remaining statements from the script.",
@@ -283,7 +276,7 @@ def _show(session, what: str) -> dict[str, dict] | None:
 def existing_objects(session=None) -> dict[str, set[str]]:
     """What exists in the current schema (names lower case), keyed like the
     statement kinds. ``resume``
-    the started tasks; ``seed`` contains sync_state once all counters exist."""
+    the started tasks."""
     tables = db.query(
         "SELECT LOWER(table_name), table_type FROM information_schema.tables "
         "WHERE table_schema = CURRENT_SCHEMA()", session=session)
@@ -297,15 +290,6 @@ def existing_objects(session=None) -> dict[str, set[str]]:
     hybrid = _show(session, "HYBRID TABLES IN SCHEMA")
     tasks = _show(session, "TASKS IN SCHEMA") or {}
     warehouses = _show(session, "WAREHOUSES LIKE 'MINIDMS_WH'") or {}
-    seeded: set[str] = set()
-    if "sync_state" in table_names:
-        try:
-            have = {str(r[0]).lower() for r in db.query("SELECT table_name FROM sync_state",
-                                                         session=session)}
-            if set(TOKEN_TABLES) <= have:
-                seeded = {"sync_state"}
-        except Exception:
-            pass
     return {
         "warehouse": set(warehouses),
         "hybrid": set(hybrid) if hybrid is not None else table_names & set(HYBRID_TABLES),
@@ -316,7 +300,7 @@ def existing_objects(session=None) -> dict[str, set[str]]:
         "stream": set(_show(session, "STREAMS IN SCHEMA") or {}),
         "task": set(tasks),
         "resume": {n for n, d in tasks.items() if str(d.get("state", "")).lower() == "started"},
-        "seed": seeded,
+        "search": set(_show(session, "CORTEX SEARCH SERVICES IN SCHEMA") or {}),
     }
 
 
@@ -324,13 +308,13 @@ NEEDED = {
     "warehouse": WAREHOUSES,
     "stage": STAGES,
     "hybrid": HYBRID_TABLES,
-    "seed": ("sync_state",),
     "table": STANDARD_TABLES,
     "view": VIEWS,
     "stream": STREAMS,
     "procedure": PROCEDURES,
     "task": TASKS,
     "resume": TASKS,
+    "search": SEARCH_SERVICES,
 }
 
 

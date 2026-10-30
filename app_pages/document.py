@@ -5,8 +5,6 @@ Every change is written to Snowflake immediately and checked against the
 version the page was rendered with: if someone else changed the same thing
 first, nothing is written and the user sees a conflict notice."""
 
-import json
-
 import polars as pl
 import streamlit as st
 
@@ -40,8 +38,10 @@ tag_defs_all = _ui.tags(include_inactive=True)
 tag_labels_all = _ui.label_map(tag_defs_all, "tag_id")
 mtypes_all = _ui.metadata_types(include_inactive=True)
 mt_all = {r["metadata_type_id"]: r for r in mtypes_all.iter_rows(named=True)}
-current_meta = {r["metadata_type_id"]: r for r in _state.table("document_metadata")
-                .filter(pl.col("document_id") == doc_id).iter_rows(named=True)}
+# Current version of every metadata value and tag chain of this document —
+# including removed values and detached tags, whose version the next edit needs.
+current_meta = model.metadata_values(_state.table("metadata_current"), doc_id)
+tag_chains = model.tag_versions(_state.table("tag_assignment_current"), doc_id)
 doc_files = _state.files().filter(pl.col("document_id") == doc_id)
 
 # What the user saw when the page was drawn — the basis of every conflict check
@@ -49,9 +49,16 @@ doc_files = _state.files().filter(pl.col("document_id") == doc_id)
 seen_doc = {**doc, "version": _state.rendered(f"doc:{doc_id}", doc["version"])}
 # Inputs with drafts: what each input started from, until it is saved or reset.
 seen_meta = {m: _state.baseline(f"{k}:meta:{m}",
-                                (r["version"], r["value"]) if r else (None, ""))
+                                (r["version"], r["value"] or "") if r else (None, ""))
              for m, r in {**{m: None for m in mt_all}, **current_meta}.items()}
-seen_tags = set(_state.baseline(f"{k}:tags", tuple(sorted(doc["tag_ids"]))))
+seen_chains = dict(_state.baseline(f"{k}:tags", tuple(sorted(tag_chains.items()))))
+seen_tags = {t for t, (_, assigned) in seen_chains.items() if assigned}
+
+
+def tag_version(tag_id: str) -> int | None:
+    """Version of the (document, tag) chain the user saw; None = never assigned."""
+    return seen_chains[tag_id][0] if tag_id in seen_chains else None
+
 seen_files = {f["file_id"]: {**f, "version": _state.rendered(f"file:{f['file_id']}",
                                                              f["version"])}
               for f in doc_files.iter_rows(named=True)}
@@ -118,7 +125,8 @@ with tab_props:
 
 with tab_meta:
     active_ids = [r["metadata_type_id"] for r in _ui.metadata_types().iter_rows(named=True)]
-    shown_ids = list(dict.fromkeys(active_ids + [m for m in current_meta if m in mt_all]))
+    shown_ids = list(dict.fromkeys(active_ids + [m for m, r in current_meta.items()
+                                                 if m in mt_all and r["value"] is not None]))
     if not shown_ids:
         st.info("No metadata types defined yet — create some on the Metadata types page.")
     else:
@@ -130,7 +138,7 @@ with tab_meta:
                 with cols[i % 2]:
                     values[mt_id] = _ui.metadata_input(
                         {**mt_all[mt_id], "default_value": None}, key=f"{mk}:{mt_id}",
-                        current=(current_meta.get(mt_id) or {}).get("value", ""),
+                        current=(current_meta.get(mt_id) or {}).get("value") or "",
                     )
             if st.form_submit_button("Save metadata"):
                 bad = _ui.invalid_numbers(values, mt_all)
@@ -167,8 +175,8 @@ with tab_tags:
                                 format_func=tag_labels.get, key=tk)
         if st.button("Save tags", key=f"{tk}:apply"):
             _state.act(write.set_tags, user, doc_id,
-                       [t for t in chosen if t not in seen_tags],
-                       [t for t in seen_tags if t not in chosen and t in tag_labels],
+                       {t: tag_version(t) for t in chosen if t not in seen_tags},
+                       {t: tag_version(t) for t in seen_tags if t not in chosen and t in tag_labels},
                        success="Tags saved.", reset=tk)
             st.rerun()
 
@@ -225,7 +233,7 @@ with tab_ai:
     enrich_all = _state.table("document_enrichment_current")
     active_type_ids = set(active_types)
     active_tag_ids = set(_ui.label_map(_ui.tags(), "tag_id"))
-    current_values = {m: r["value"] for m, r in current_meta.items()}
+    current_values = {m: r["value"] for m, r in current_meta.items() if r["value"] is not None}
     for f in doc_files.iter_rows(named=True):
         with st.container(border=True):
             st.markdown(f"**{f['filename'] or f['file_id']}**")
@@ -267,7 +275,8 @@ with tab_ai:
                         c1.write("Tags: " + ", ".join(tag_labels_all.get(t, t)
                                                       for t in sug["tag_ids"]))
                         if c2.button("Apply", key=f"{sk}:tags"):
-                            _state.act(write.set_tags, user, doc_id, sug["tag_ids"], [],
+                            _state.act(write.set_tags, user, doc_id,
+                                       {t: tag_version(t) for t in sug["tag_ids"]}, {},
                                        source=source, success="Tags applied.")
                             st.rerun()
                     for mt_id, value in sug["metadata"].items():
@@ -291,27 +300,25 @@ with tab_ai:
 
 
 def _detail(row: dict) -> str:
-    try:
-        data = json.loads(row["data"] or "{}")
-    except ValueError:
-        return row["data"] or ""
-    if "metadata_type_id" in data:
-        label = (mt_all.get(data["metadata_type_id"]) or {}).get("label", data["metadata_type_id"])
-        data = {label: data.get("value", "(removed)"),
-                **({"source": data["source"]} if "source" in data else {})}
-    if "tag_id" in data:
-        data = {"tag": tag_labels_all.get(data["tag_id"], data["tag_id"]),
-                **({"source": data["source"]} if "source" in data else {})}
-    if "document_type_id" in data:
-        data = {**data, "document_type_id": type_labels.get(data["document_type_id"],
-                                                             data["document_type_id"])}
-    return ", ".join(f"{k}={v}" for k, v in data.items())
+    item, value = row["item_id"], row["value"]
+    if row["entity"] == "metadata":
+        label = (mt_all.get(item) or {}).get("label", item)
+        text = f"{label} = {value if value is not None else '(removed)'}"
+    elif row["entity"] == "tag":
+        text = tag_labels_all.get(item, item)
+    elif row["entity"] == "file":
+        names = dict(zip(all_doc_files["file_id"], all_doc_files["filename"]))
+        text = names.get(item) or item
+    else:
+        text = f"label = {value}" if value else ""
+    return text + (f" (from {row['source']})" if row["source"] else "")
 
 
 with tab_hist:
-    hist = read.load_history(doc_id, _state.tokens()["change_log"])
+    all_doc_files = _state.files(include_inactive=True).filter(pl.col("document_id") == doc_id)
+    hist = read.load_history(doc_id, read.history_token(_state.tokens()))
     rows = [{"event_ts": r["event_ts"], "actor": r["actor"],
-             "event": f"{r['entity'].replace('document_', '')} {r['op']}",
+             "event": f"{r['entity']} {r['op']} (v{r['version']})",
              "detail": _detail(r)} for r in hist.iter_rows(named=True)]
     for f in doc_files.iter_rows(named=True):
         if f["extracted_at"] is not None:

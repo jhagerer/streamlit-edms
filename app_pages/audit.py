@@ -4,9 +4,9 @@ import streamlit as st
 from core import read
 
 st.title("Audit trail")
-st.caption("Every human edit is recorded in `change_log` in the same transaction as the edit; "
-           "uploads and AI processing are recorded in their own tables. This page reads the "
-           "`audit_v` view, which unions them.")
+st.caption("Every table is append-only, so the history is the data: each human edit is a new "
+           "version in its log, uploads and AI processing are rows in their own tables. This "
+           "page reads the `audit_v` view, which unions them.")
 
 limit = st.select_slider("Rows", options=[500, 1000, 5000, 20000], value=1000)
 try:

@@ -53,10 +53,14 @@ def seed(fake):
         "('enr1', '2020-01-02 00:00:01.000000', 'system:ai', 'f1', 'd1', 'claude-sonnet-4-5', "
         "'done', 'An invoice over 99 EUR.', 't2', '[\"blue\"]', "
         "'[{\"metadata_type_id\": \"m1\", \"value\": \"99\"}]')")
-    # The request is older than the results: the file is processed, not pending.
-    fake.conn.execute("UPDATE ai_request SET requested_at = '2020-01-01 00:00:00.000000'")
-    fake.conn.execute("UPDATE sync_state SET seq = seq + 1 "
-                      "WHERE table_name IN ('ai_request', 'document_text', 'document_enrichment')")
+    req = fake.rows("SELECT event_id FROM ai_request")[0]["event_id"]
+    fake.conn.execute("INSERT INTO ai_job_log (event_id, event_ts, request_id, file_id, "
+                      "document_id, step) VALUES ('j1', '2020-01-02 00:00:02.000000', ?, 'f1', "
+                      "'d1', 'finished')", [req])
+    fake.conn.execute("INSERT INTO search_corpus (event_id, created_at, run_id, file_id, "
+                      "document_id, filename, kind, chunk_no, text) VALUES ('c1', "
+                      "'2020-01-02 00:00:02.000000', ?, 'f1', 'd1', 'a.txt', 'text', 0, "
+                      "'Invoice no. 42, total 99 EUR')", [req])
 
 
 @pytest.mark.parametrize("page", PAGES)
@@ -76,9 +80,9 @@ def test_no_save_buttons_every_change_is_written_immediately(fake):
     click(at.button, "Add")
     at.run()
     assert not at.exception, at.exception
-    assert [r["label"] for r in fake.rows("SELECT label FROM tag")] == ["Urgent"]
-    assert fake.rows("SELECT entity, op, actor FROM change_log") == [
-        {"entity": "tag", "op": "create", "actor": "alice"}]
+    assert [r["label"] for r in fake.rows("SELECT label FROM tag_current")] == ["Urgent"]
+    assert fake.rows("SELECT version, op, actor FROM tag_log") == [
+        {"version": 1, "op": "create", "actor": "alice"}]
     assert any(t.value == "Urgent" for t in at.text_input)          # cache reloaded
     assert not any(k.startswith("sessions/") for k in fake.stage)  # no session snapshots
 
@@ -99,10 +103,13 @@ def test_document_list_and_trash_restore(fake):
     at.run()
     assert not at.exception, at.exception
     assert at.title[0].value.startswith("🗑️")
-    assert fake.rows("SELECT status, version FROM document") == [{"status": "trashed", "version": 2}]
+    assert fake.rows("SELECT status, version FROM document_current") == [
+        {"status": "trashed", "version": 2}]
     click(at.button, "Restore")
     at.run()
-    assert fake.rows("SELECT status, version FROM document") == [{"status": "active", "version": 3}]
+    assert fake.rows("SELECT status, version FROM document_log ORDER BY version") == [
+        {"status": "active", "version": 1}, {"status": "trashed", "version": 2},
+        {"status": "active", "version": 3}]                  # appended, never updated
 
 
 def test_concurrent_edit_shows_conflict_and_writes_nothing(fake):
@@ -111,12 +118,12 @@ def test_concurrent_edit_shows_conflict_and_writes_nothing(fake):
     at.query_params["doc"] = "d1"
     at.switch_page("app_pages/document.py").run()
     # Someone else trashes the document after this page was rendered.
-    write.update_document("bob", fake.rows("SELECT * FROM document")[0], {"label": "Bob's"})
+    write.update_document("bob", fake.rows("SELECT * FROM document_current")[0], {"label": "Bob's"})
     click(at.button, "Move to trash")
     at.run()
     assert not at.exception, at.exception
     assert any("changed by someone else" in e.value for e in at.error)
-    assert fake.rows("SELECT label, status, version FROM document") == [
+    assert fake.rows("SELECT label, status, version FROM document_current") == [
         {"label": "Bob's", "status": "active", "version": 2}]
     assert at.title[0].value == "Bob's"                    # the page now shows the latest
 
@@ -132,11 +139,9 @@ def test_ai_suggestions_apply_with_provenance(fake):
     apply_buttons[2].click()                               # metadata: amount = 99
     at.run()
     assert not at.exception, at.exception
-    assert fake.rows("SELECT value, version, updated_by FROM document_metadata") == [
+    assert fake.rows("SELECT value, version, updated_by FROM metadata_current") == [
         {"value": "99", "version": 2, "updated_by": "alice"}]
-    data = fake.rows("SELECT data FROM change_log WHERE entity = 'document_metadata' "
-                     "ORDER BY event_ts DESC LIMIT 1")[0]["data"]
-    assert '"source": "ai:enr1"' in data
+    assert fake.rows("SELECT source FROM metadata_log WHERE version = 2") == [{"source": "ai:enr1"}]
     assert len([b for b in at.button if b.label == "Apply"]) == 2
 
 
@@ -154,13 +159,18 @@ def test_process_again_requests_ai_in_snowflake(fake):
     assert any("AI is processing 1 file" in i.value for i in at.sidebar.info)
 
 
-def test_search_uses_text_and_summary(fake):
+def test_search_uses_cortex_search(fake):
     seed(fake)
     at = app().run()
     at.switch_page("app_pages/search.py").run()
     at.text_input(key="search:q").input("EUR").run()
     assert not at.exception, at.exception
-    assert at.dataframe[0].value["label"].tolist() == ["Invoice 42"]
+    grid = at.dataframe[0].value
+    assert grid["label"].tolist() == ["Invoice 42"]
+    assert "99 EUR" in grid["match"].iloc[0]                  # best matching chunk shown
+    assert fake.search_requests[-1]["query"] == "EUR"
+    at.text_input(key="search:q").input("nothing-matches").run()
+    assert any("No matching documents" in i.value for i in at.info)
 
 
 def test_any_warehouse_works_but_one_is_needed(fake, monkeypatch):
@@ -187,11 +197,10 @@ def test_missing_schema_points_to_setup_and_setup_creates_it(fake):
     at.switch_page("app_pages/setup.py").run()
     assert not at.exception, at.exception
     assert at.title[0].value == "Setup"
-    click(at.button, "Run all 10 statement(s) of this step")    # hybrid tables + seed
+    click(at.button, "Run all 7 statement(s) of this step")     # the hybrid logs
     at.run()
     assert not at.exception, at.exception
-    assert sum(q.startswith("CREATE HYBRID TABLE") for q in fake.executed) == 9
-    assert any("FROM VALUES" in q for q in fake.executed)        # sync_state seed
+    assert sum(q.startswith("CREATE HYBRID TABLE") for q in fake.executed) == 7
 
     at.switch_page("app_pages/documents.py").run()
     assert not at.exception, at.exception
@@ -204,8 +213,8 @@ def test_setup_starter_definitions(fake):
     click(at.button, "Add starter definitions")
     at.run()
     assert not at.exception, at.exception
-    assert fake.count("document_type") == 4 and fake.count("tag") == 3
-    assert fake.count("metadata_type") == 4
+    assert fake.count("document_type_log") == 4 and fake.count("tag_log") == 3
+    assert fake.count("metadata_type_log") == 4
 
 
 def test_admin_ai_tab(fake):
@@ -288,7 +297,7 @@ def test_enter_own_credentials_when_not_connected(fake, monkeypatch):
 
 def test_history_shows_human_and_ai_events(fake):
     seed(fake)
-    write.update_document("carol", fake.rows("SELECT * FROM document")[0], {"label": "Renamed"})
+    write.update_document("carol", fake.rows("SELECT * FROM document_current")[0], {"label": "Renamed"})
     at = app()
     at.query_params["doc"] = "d1"
     at.switch_page("app_pages/document.py").run()
@@ -305,12 +314,13 @@ def test_concurrent_tag_change_is_kept_not_overwritten(fake):
     at = app()
     at.query_params["doc"] = "d1"
     at.switch_page("app_pages/document.py").run()
-    write.set_tags("bob", "d1", ["blue"], [])                 # concurrent change
+    write.set_tags("bob", "d1", {"blue": None}, {})           # concurrent change
     at.multiselect(key="doc:d1:tags").set_value([]).run()     # Alice removes "red"
     click(at.button, "Save tags")
     at.run()
     assert not at.exception, at.exception
-    assert [r["tag_id"] for r in fake.rows("SELECT tag_id FROM document_tag")] == ["blue"]
+    assert fake.rows("SELECT tag_id FROM tag_assignment_current WHERE assigned") == [
+        {"tag_id": "blue"}]
 
 
 def test_concurrent_metadata_edit_is_a_conflict(fake):
@@ -324,5 +334,5 @@ def test_concurrent_metadata_edit_is_a_conflict(fake):
     at.run()
     assert not at.exception, at.exception
     assert any("changed by someone else" in e.value for e in at.error)
-    assert fake.rows("SELECT value FROM document_metadata") == [{"value": "13"}]
+    assert fake.rows("SELECT value FROM metadata_current") == [{"value": "13"}]
     assert at.text_input(key="doc:d1:meta:m1").value == "13"  # draft reset to the latest
