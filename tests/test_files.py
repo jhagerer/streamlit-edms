@@ -23,6 +23,9 @@ def test_remove_statement_is_exact_and_only_for_managed_paths():
     assert stmt == f"REMOVE @doc_files/{SHA}/ PATTERN = '.*/a\\\\.pd$'"
     assert files.remove_statement("../x") is None
     assert files.remove_statement(f"{SHA}/it's.pdf") is None
+    assert files.remove_statement(f"{SHA}/derived/page-0001.pdf") == (
+        f"REMOVE @doc_files/{SHA}/derived/ PATTERN = '.*/page\\\\-0001\\\\.pdf$'")
+    assert files.remove_statement(f"{SHA}/other/x.pdf") is None
 
 
 def test_orphans_respects_references_and_age():
@@ -33,6 +36,19 @@ def test_orphans_respects_references_and_age():
     })
     out = files.orphans(staged, {"@doc_files/a/1.pdf"}, min_age_days=2, now=datetime(2026, 1, 11))
     assert out["relative_path"].to_list() == ["b/2.pdf"]
+
+
+def test_derived_pages_belong_to_their_checksum_folder():
+    a, b = "a" * 64, "b" * 64
+    staged = pl.DataFrame({
+        "relative_path": [f"{a}/x.png", f"{a}/derived/converted.pdf", f"{a}/derived/page-0001.pdf",
+                          f"{b}/derived/page-0001.pdf"],
+        "size": [1] * 4,
+        "last_modified": [datetime(2026, 1, 1)] * 4,
+    })
+    out = files.orphans(staged, {f"@doc_files/{a}/x.png"}, min_age_days=2,
+                        now=datetime(2026, 1, 11))
+    assert out["relative_path"].to_list() == [f"{b}/derived/page-0001.pdf"]
 
 
 def test_stage_upload_is_content_addressed_and_writes_no_rows(fake):
@@ -54,11 +70,14 @@ def test_same_content_same_name_is_stored_once(fake):
 
 
 def test_ai_extensions_match_the_procedure():
-    """The app's list and the regex in process_ai() must agree."""
+    """The app's lists and the ones in convert_to_pdf_pages() must agree."""
+    import ast
     import re
 
     from core import setup
 
-    proc = [s.sql for s in setup.setup_statements() if s.kind == "procedure"][0]
-    exts = re.search(r"\[\.\]\(([a-z|]+)\)\$", proc).group(1).split("|")
-    assert {f".{e}" for e in exts} == files.AI_EXTENSIONS
+    proc = {s.name: s.sql for s in setup.setup_statements() if s.kind == "procedure"}
+    code = proc["convert_to_pdf_pages"]
+    for name in ("PDF_EXTENSIONS", "IMAGE_EXTENSIONS", "TEXT_EXTENSIONS"):
+        literal = re.search(rf"^{name} = (\{{.*\}})$", code, re.M).group(1)
+        assert ast.literal_eval(literal) == getattr(files, name), name

@@ -7,8 +7,10 @@ staging and stored_file, the staged bytes are orphaned; the admin page can
 clean them up.
 
 Text extraction does NOT happen here: ai_request fires a triggered task in
-Snowflake that runs AI_COMPLETE (process_ai() in sql/minidms-setup.sql), so the
-OCR text and enrichments are lineage-linked to stored_file.
+Snowflake (process_ai() in sql/minidms-setup.sql) that converts the file to
+PDF, writes one PDF per page to ``@doc_files/{sha256}/derived/`` and runs
+AI_COMPLETE on every page, so the OCR and enrichments are lineage-linked to
+the page files.
 """
 
 from __future__ import annotations
@@ -27,10 +29,13 @@ from core.session import cache_data
 
 STAGE = "@doc_files"
 
-# Formats AI_COMPLETE reads with claude-sonnet-4-5; others are marked
-# 'skipped' by the task. Keep in sync with the extension list in process_ai().
-AI_EXTENSIONS = {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".csv", ".txt", ".md", ".xhtml",
-                 ".jpg", ".jpeg", ".png", ".gif", ".webp"}
+# Formats convert_to_pdf_pages() turns into PDF pages; others are marked
+# 'skipped' by the task. Keep in sync with the lists in that procedure.
+PDF_EXTENSIONS = {".pdf"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
+TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".json", ".xml"}
+AI_EXTENSIONS = PDF_EXTENSIONS | IMAGE_EXTENSIONS | TEXT_EXTENSIONS
+DERIVED = "derived"   # {sha256}/derived/: the document as PDF and one PDF per page
 
 
 def safe_ext(filename: str) -> str:
@@ -40,7 +45,7 @@ def safe_ext(filename: str) -> str:
 
 def safe_filename(filename: str) -> str:
     """A stage-path-safe version of the original name. Keeps the extension
-    (AI_COMPLETE detects the format from it); the original name is kept
+    (the converter picks the format from it); the original name is kept
     unchanged in stored_file.filename."""
     base = os.path.basename(filename.replace("\\", "/")).strip()
     stem, ext = os.path.splitext(base)
@@ -125,24 +130,31 @@ def staged_files(session=None) -> pl.DataFrame:
 def orphans(staged: pl.DataFrame, referenced_paths: set[str], min_age_days: int,
             now: datetime | None = None) -> pl.DataFrame:
     """Staged files that no stored_file row references and that are older than
-    ``min_age_days`` (someone may be mid-upload). Pure."""
+    ``min_age_days`` (someone may be mid-upload). Derived files (PDF pages)
+    belong to their checksum folder: they are orphans only when no file in
+    that folder is referenced. Pure."""
     now = now or write.now_utc()
     refs = {p.removeprefix(f"{STAGE}/") for p in referenced_paths if p}
+    folders = [r.split("/", 1)[0] for r in refs]
     cutoff = now - timedelta(days=min_age_days)
+    folder = pl.col("relative_path").str.split("/").list.first()
+    derived = pl.col("relative_path").str.contains(f"^[0-9a-f]{{64}}/{DERIVED}/")
     return staged.filter(
         ~pl.col("relative_path").is_in(list(refs))
+        & ~(derived & folder.is_in(folders))
         & (pl.col("last_modified").is_null() | (pl.col("last_modified") < cutoff))
     )
 
 
-_MANAGED = re.compile(r"^([0-9a-f]{64})/([A-Za-z0-9._-]+)$")
+_MANAGED = re.compile(rf"^([0-9a-f]{{64}}(?:/{DERIVED})?)/([A-Za-z0-9._-]+)$")
 
 
 def remove_statement(rel: str) -> str | None:
     """REMOVE for exactly one managed file. REMOVE matches by prefix, so the
     folder is given as the path and the file name as an anchored PATTERN —
     otherwise removing '<sha>/a.pd' would also remove '<sha>/a.pdf'. Paths
-    that do not look like '{sha256}/{safe name}' are never touched. Pure."""
+    that do not look like '{sha256}[/derived]/{safe name}' are never touched.
+    Pure."""
     m = _MANAGED.match(rel)
     if not m:
         return None

@@ -14,8 +14,9 @@ SETUP_PAGE = "app_pages/setup.py"
 
 SAVE_COPY = (
     "Every change is saved to Snowflake immediately — there is no separate save step. "
-    "After an upload, Snowflake runs OCR, a summary, type and tag suggestions and "
-    "metadata extraction with AI_COMPLETE; the results appear on the document shortly after."
+    "After an upload, Snowflake converts the file to PDF, reads it page by page with "
+    "AI_COMPLETE and adds a summary, type and tag suggestions and metadata; the results "
+    "appear on the document shortly after."
 )
 
 AI_BADGES = {"queued": "⏳ AI running", "failed": "⚠️ AI failed", "missing": "⚠️ not processed",

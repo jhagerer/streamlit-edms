@@ -5,9 +5,10 @@ from app_pages import _state, _ui
 from core import model, read, search
 
 st.title("Search")
-st.caption("Semantic and keyword search over the OCR text and the AI summaries, served by "
-           "the Cortex Search service `document_search` — the sink of the ingest pipeline. "
-           "Results are ranked by relevance; type and tag filters apply afterwards.")
+st.caption("Semantic and keyword search over every page — its summary, headings and image "
+           "and table summaries — served by the Cortex Search service `document_search`, the "
+           "sink of the ingest pipeline. Results are ranked by their best page; type and tag "
+           "filters apply afterwards.")
 
 query = st.text_input("Search", key="search:q",
                       placeholder="e.g. “invoices from ACME over 500 EUR” or a phrase")

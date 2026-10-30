@@ -1,17 +1,18 @@
 """The AI pipeline as seen from the app: task state, recent runs, starting a
-run on demand. The work itself — OCR and enrichment with AI_COMPLETE — runs
-inside Snowflake in process_ai() (sql/minidms-setup.sql), fired by a stream on
-ai_request, so its output carries column-level lineage."""
+run on demand. The work itself — PDF conversion, page OCR and enrichment with
+AI_COMPLETE — runs inside Snowflake in process_ai() (sql/minidms-setup.sql),
+fired by a stream on ai_request, so its output carries column-level lineage."""
 
 from __future__ import annotations
 
 import polars as pl
 
 from core import db
-from core.schema import AI_MODEL
+from core.schema import AI_MODEL, OCR_MODEL
 
 TASK = "process_ai_task"
 MODEL = AI_MODEL
+PAGE_MODEL = OCR_MODEL
 
 
 def task_state(session=None) -> dict | None:

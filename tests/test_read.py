@@ -39,21 +39,24 @@ def test_views_and_history(fake):
     assert hist.filter(pl.col("entity") == "metadata")["value"].to_list() == ["v"]
 
 
-def _corpus(fake, run, file_id, doc_id, chunks, ts):
-    for i, text in enumerate(chunks):
+def _pages(fake, run, file_id, doc_id, summaries, ts, status="done"):
+    for i, text in enumerate(summaries, start=1):
         fake.conn.execute(
-            "INSERT INTO search_corpus (event_id, created_at, run_id, file_id, document_id, "
-            "filename, kind, chunk_no, text) VALUES (?, ?, ?, ?, ?, 'a.pdf', 'text', ?, ?)",
-            [f"{run}-{i}", ts, run, file_id, doc_id, i, text])
+            "INSERT INTO page_ocr (event_id, created_at, run_id, file_id, document_id, filename, "
+            "page_no, status, ocr_text, page_short_summary, index_text) "
+            "VALUES (?, ?, ?, ?, ?, 'a.pdf', ?, ?, 'raw text', ?, ?)",
+            [f"{run}-{i}", ts, run, file_id, doc_id, i, status, text, text])
 
 
 def test_cortex_search_request_and_ranking(fake):
-    _corpus(fake, "r1", "f1", "d1", ["Rechnung über 42 EUR von ACME"], "2026-01-01 00:00:00.000000")
-    _corpus(fake, "r2", "f2", "d2", ["ACME Vertrag"], "2026-01-01 00:00:00.000000")
+    _pages(fake, "r1", "f1", "d1", ["Deckblatt", "Rechnung über 42 EUR von ACME"],
+           "2026-01-01 00:00:00.000000")
+    _pages(fake, "r2", "f2", "d2", ["ACME Vertrag"], "2026-01-01 00:00:00.000000")
     # f2 was processed again: only the latest run counts.
-    _corpus(fake, "r3", "f2", "d2", ["Kündigung"], "2026-01-02 00:00:00.000000")
+    _pages(fake, "r3", "f2", "d2", ["Kündigung"], "2026-01-02 00:00:00.000000")
     hits = search.search("ACME Rechnung", "DB", "SCHEMA")
-    assert [h.document_id for h in hits] == ["d1"]
+    assert [(h.document_id, h.page_no) for h in hits] == [("d1", 2)]   # one hit per page
+    assert search.best_snippets(hits)["d1"] == "p. 2: Rechnung über 42 EUR von ACME"
     req = fake.search_requests[-1]
     assert req["query"] == "ACME Rechnung" and req["columns"] == search.COLUMNS
     sql = [q for q in fake.queries if "SEARCH_PREVIEW" in q][-1]
@@ -69,11 +72,12 @@ def test_search_query_cannot_break_out_of_the_literal(fake):
 
 
 def test_ranking_helpers():
-    hits = [search.Hit("d2", "f2", "text", "b  " * 200), search.Hit("d1", "f1", "text", "a"),
-            search.Hit("d2", "f3", "summary", "c"), search.Hit("d3", "gone", "text", "d")]
+    hits = [search.Hit("d2", "f2", 4, "b  " * 200), search.Hit("d1", "f1", None, "a"),
+            search.Hit("d2", "f3", 1, "c"), search.Hit("d3", "gone", 1, "d")]
     assert search.ranked_document_ids(hits, {"f1", "f2", "f3"}) == ["d2", "d1"]
     snips = search.best_snippets(hits, width=20)
-    assert snips["d1"] == "a" and len(snips["d2"]) == 20 and snips["d2"].endswith("…")
+    assert snips["d1"] == "a" and len(snips["d2"]) == 20 and snips["d2"].startswith("p. 4: b")
+    assert snips["d2"].endswith("…")
 
 
 def test_conform_empty_and_strings():

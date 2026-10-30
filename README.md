@@ -4,9 +4,10 @@ A deliberately small clone of [Mayan EDMS](https://www.mayan-edms.com/), built w
 Streamlit. It runs **in Streamlit in Snowflake** (container runtime), **locally**, and on
 **Streamlit Community Cloud**. All data lives in Snowflake.
 
-Features: upload, immutable content-addressed files with SHA-256 checksums, OCR and AI
-enrichment with `AI_COMPLETE` (summary, document-type and tag suggestions, metadata
-extraction), semantic and keyword search with **Cortex Search**, document types, typed
+Features: upload, immutable content-addressed files with SHA-256 checksums, conversion to
+PDF and page-by-page structured OCR with `AI_COMPLETE`, AI enrichment (summary,
+document-type and tag suggestions, metadata extraction), page-level semantic and keyword
+search with **Cortex Search**, document types, typed
 metadata, tags, trash, conflict detection for concurrent edits, per-document history and
 an audit trail — with column-level lineage for everything the AI produces.
 
@@ -33,19 +34,31 @@ Schema: [`sql/minidms-setup.sql`](sql/minidms-setup.sql)
    - `UNIQUE (event_id)`: a retried action fails the same way, but its `event_id` is already
      there, so it is reported as **already applied**, never applied twice.
 4. **Standard tables for facts and AI output.** Uploaded files (`stored_file`), AI requests,
-   OCR text, enrichments and the search corpus are append-only standard tables, written by
-   `INSERT … SELECT` inside Snowflake, so Snowflake records **column-level lineage** from the
-   file to the text, the summary, the suggestions and the search chunks.
+   the PDF conversion and pages, the structured OCR per page, the text and the enrichments
+   are append-only standard tables. The AI output is written by `INSERT … SELECT` inside
+   Snowflake, so Snowflake records **column-level lineage** from the page file to the OCR
+   fields, the text, the summary and the suggestions.
 5. **The ingest pipeline runs in Snowflake, right after the upload.** An upload appends to
    `ai_request`; a stream on it fires a triggered task, which calls `process_ai()`:
-   OCR and enrichment with `AI_COMPLETE` (`claude-sonnet-4-5`), then the text is split into
-   chunks (`SPLIT_TEXT_RECURSIVE_CHARACTER`) and appended, with the summary, to
-   `search_corpus`. The app never calls Cortex itself.
+   1. **Convert and split** — the Python procedure `convert_to_pdf_pages()` converts the
+      file to PDF (PDF passes through; images become one page per frame; plain text is
+      typeset) and writes one single-page PDF per page to `@doc_files/{sha256}/derived/`
+      (`pdf_conversion`, `pdf_page`). Other file types are `skipped`.
+   2. **Page OCR** — `ocr_pages()` calls `AI_COMPLETE` (`claude-haiku-4-5`) with a JSON
+      schema on every page, in parallel, into `page_ocr`: `ocr_text` (images described at
+      length inline as `[Image: …]`), `headings_list`, `image_short_summaries_list`,
+      `table_summaries_list`, `page_short_summary`, plus `index_text` = all fields except
+      `ocr_text`. If one page fails, the pages are retried one by one.
+   3. **Text** — the pages' `ocr_text` in order go to `document_text`.
+   4. **Enrichment** — `AI_COMPLETE` (`claude-sonnet-4-5`) writes the summary, type and
+      tag suggestions and metadata to `document_enrichment`.
+
+   The app never calls Cortex itself.
 6. **Cortex Search is the sink and the search engine.** The service `document_search`
-   indexes the latest run per file in `search_corpus` (multilingual embedding model,
-   target lag 1 minute). The Search page queries it and gets ranked chunks with
-   `document_id`/`file_id`; type, tag and trash filters run in the app, because those live
-   in the hybrid tables.
+   indexes **one search document per page**: the `index_text` of the latest successful run
+   per file in `page_ocr` (multilingual embedding model, target lag 1 minute). The Search
+   page queries it and gets ranked pages with `document_id`/`file_id`/`page_no`; type, tag
+   and trash filters run in the app, because those live in the hybrid tables.
 7. **Any warehouse; adaptive only for bootstrapping.** The app runs on whatever warehouse
    the connection (or the Streamlit app) uses. For an empty account, the setup creates the
    adaptive warehouse `minidms_wh` if it does not exist; the AI task and the search service
@@ -63,7 +76,7 @@ Schema: [`sql/minidms-setup.sql`](sql/minidms-setup.sql)
 | Data | Table type | Why |
 |---|---|---|
 | Documents, metadata values, tag assignments, attachments, definitions | **hybrid**, append-only | Edited one data point at a time by people; enforced `PRIMARY KEY (id, version)` and `UNIQUE (event_id)` give conflict detection and idempotent retries |
-| `stored_file`, `ai_request`, `document_text`, `document_enrichment`, `search_corpus`, `ai_job_log` | standard, append-only | Facts and AI output written by `INSERT … SELECT` — lineage; large text; `search_corpus` is the change-tracked source of the Cortex Search service |
+| `stored_file`, `ai_request`, `pdf_conversion`, `pdf_page`, `page_ocr`, `document_text`, `document_enrichment`, `ai_job_log` | standard, append-only | Facts and AI output written by `INSERT … SELECT` — lineage; large text; `page_ocr` is the change-tracked source of the Cortex Search service |
 
 ## Project layout
 
@@ -114,15 +127,15 @@ links to it. It walks through:
    (then *Use minidms_wh now* when the session has no warehouse)
 3. **Stage** — `@doc_files`
 4. **Hybrid tables** — the seven append-only logs people edit
-5. **Standard tables** — `stored_file`, `ai_request`, `document_text`,
-   `document_enrichment`, `search_corpus`, `ai_job_log`
+5. **Standard tables** — `stored_file`, `ai_request`, `pdf_conversion`, `pdf_page`,
+   `page_ocr`, `document_text`, `document_enrichment`, `ai_job_log`
 6. **Views** — current state per entity, latest text / enrichment per file, AI state per
    file, per-document history, audit trail
 7. **AI pipeline** — stream `ai_request_stream`, procedure `process_ai()`, triggered task
    `process_ai_task` on `minidms_wh`, and `ALTER TASK … RESUME`
-8. **Cortex Search** — the service `document_search` over `search_corpus`
+8. **Cortex Search** — the service `document_search` over `page_ocr`
 9. **Grants** (optional) — for an app role: `SELECT, INSERT` on the hybrid logs,
-   `stored_file` and `ai_request`; `SELECT` only on the AI output and `search_corpus`; never
+   `stored_file` and `ai_request`; `SELECT` only on the pages and the AI output; never
    `UPDATE` or `DELETE`; `USAGE` on the search service and `minidms_wh`; `MONITOR, OPERATE`
    on the task
 10. **PyPI integration** (optional, SiS container runtime; usually ACCOUNTADMIN)
@@ -130,7 +143,7 @@ links to it. It walks through:
 12. **Starter definitions** (optional) — a few document types, metadata types and tags
 
 Every statement is shown before it runs; each has its own *Run* button, and every step
-has *Run all*. A progress bar shows how many of the 32 objects exist (including whether
+has *Run all*. A progress bar shows how many of the 36 objects exist (including whether
 the task is started); a log shows each result.
 
 Who may run the setup statements: on a local run, you; with credentials you entered
@@ -256,7 +269,7 @@ pytest
 The tests need no Snowflake account. The fake session runs on in-memory SQLite with the
 same constraints as the hybrid logs (`PRIMARY KEY (id, version)`, `UNIQUE (event_id)`),
 so transactions, rollbacks, version conflicts and idempotent retries behave for real; a
-small stand-in answers Cortex Search queries from `search_corpus`. The tests cover the
+small stand-in answers Cortex Search queries from `page_ocr.index_text`. The tests cover the
 write commands (append-only, conflicts, retries, provenance), the row-count tokens and
 caches, the per-session lock, the AI state per file and the suggestions, Cortex Search
 requests, ranking and literal escaping, the setup script (it must match `core/schema.py`
@@ -269,22 +282,26 @@ and the real pages driven with Streamlit's `AppTest` — including concurrent ed
 - **Upload** — choose files, a document type, tags and metadata. Each file becomes one
   document and is saved immediately. The bytes go to `@doc_files/{sha256}/{filename}`;
   same content under the same name is stored once.
-- **Ingest pipeline** — right after the upload, Snowflake runs `process_ai()`: OCR with
-  `AI_COMPLETE` (or the text of an identical file), then summary, document-type and tag
-  suggestions and metadata extraction with `AI_COMPLETE` and a JSON schema, then the text
-  chunks and the summary go to `search_corpus`, which Cortex Search indexes. File types
-  `AI_COMPLETE` does not read are `skipped`. Lists show the AI state per document.
-- **Document → Text & AI** — the OCR text, the summary and the **suggestions**. Nothing
+- **Ingest pipeline** — right after the upload, Snowflake runs `process_ai()`: convert to
+  PDF, split into pages, structured OCR per page with `AI_COMPLETE` (Haiku), then summary,
+  document-type and tag suggestions and metadata extraction (Sonnet). An identical file
+  that was processed before reuses its page OCR. Supported: PDF; JPG, PNG, GIF, WEBP, BMP,
+  TIFF; TXT, MD, CSV, JSON, XML. Other types are `skipped`. Lists show the AI state per
+  document.
+- **Document → Text & AI** — the OCR text, the structured result per page (what the search
+  indexes), the summary and the **suggestions**. Nothing
   changes until you click *Apply*; the new version then records `source = ai:<enrichment
   id>`. *Process again* runs the pipeline again (and re-indexes the file).
 - **Editing** — every change appends a new version. If someone else changed the same thing
   since your page was drawn, you see *“changed by someone else”*, nothing is written, and
   the page shows the latest data. Edits to different things do not conflict.
 - **Search** — type a question or keywords; Cortex Search returns the best-matching
-  chunks, the list shows the documents in order of relevance with the best match. Type and
+  pages, the list shows the documents in order of relevance with their best page
+  (*“p. 3: …”*). Type and
   tag filters apply on top. New documents are searchable once the pipeline has run and the
   service has refreshed (target lag 1 minute).
-- **History** — every version of the document's records, plus OCR and enrichment events.
+- **History** — every version of the document's records, plus conversion, OCR and
+  enrichment events.
 - **Admin** — AI task state, counts, failures, *process unprocessed files*, *run the task
   now*, recent runs; table sizes; orphaned-file scan and cleanup; credit usage.
 
@@ -310,7 +327,14 @@ message and sees the latest data.
   from many simultaneous users queue up briefly.
 - Search results lag the upload by the pipeline run plus the service's target lag.
 - Type, tag and trash filters are applied after the search (the service returns up to 50
-  chunks), so a heavily filtered search can show fewer results than exist.
+  pages), so a heavily filtered search can show fewer results than exist.
+- The raw `ocr_text` is not indexed (by design): a search matches the page summary,
+  headings and image/table summaries. A word that appears only in the body text may not
+  be found.
+- Office files (Word, Excel, PowerPoint) are not converted — that would need LibreOffice,
+  which does not run inside Snowflake. Text files are typeset in Courier, which covers
+  Latin-1 only (other characters show as boxes).
+- Very long PDFs cost one `AI_COMPLETE` call per page and run inside one task run.
 - Uploaded bytes of an interrupted upload stay in `@doc_files` until cleaned up on Admin.
 - No page viewer — use the OCR text and the download button.
 - The schema has no link between document types and metadata types, so all active
@@ -325,18 +349,26 @@ These could not be verified without a Snowflake account. Please check them once:
 2. **Hybrid tables** are available in your account/region, with
    `PRIMARY KEY (…, version)` plus `UNIQUE (event_id)`; a duplicate raises an error that
    mentions the duplicate key (the app turns it into a conflict or "already applied").
-3. `process_ai()` compiles and works: upload one PDF, then check
-   `SELECT * FROM ai_status_v;`, `SELECT * FROM search_corpus;` and
-   `TABLE(INFORMATION_SCHEMA.TASK_HISTORY(TASK_NAME => 'PROCESS_AI_TASK'))` — in particular
-   the `AI_COMPLETE` calls (`PROMPT(…, TO_FILE(…))`; `model => …, prompt => …,
-   response_format => {…}`) and `SPLIT_TEXT_RECURSIVE_CHARACTER`.
-4. **Cortex Search:** `CREATE CORTEX SEARCH SERVICE … EMBEDDING_MODEL =
+3. **Conversion:** the Anaconda terms are accepted and `pypdf`, `pillow` and `reportlab`
+   are available to Python procedures; `SnowflakeFile.open('@doc_files/…', 'rb',
+   require_scoped_url=False)` reads the upload and `session.file.put_stream` writes the
+   page PDFs from inside the procedure. Upload a PDF, a PNG and a TXT and check
+   `SELECT * FROM pdf_conversion;` and `LIST @doc_files PATTERN = '.*/derived/.*';`.
+4. **Page OCR:** `claude-haiku-4-5` is available to `AI_COMPLETE` in your region, and the
+   call form `AI_COMPLETE(model => …, prompt => …, file => TO_FILE(…), model_parameters =>
+   …, response_format => …)` works on a single-page PDF. Check `SELECT * FROM page_ocr;`,
+   `SELECT * FROM ai_status_v;` and
+   `TABLE(INFORMATION_SCHEMA.TASK_HISTORY(TASK_NAME => 'PROCESS_AI_TASK'))`. If PDFs are
+   not accepted as files, render the pages to PNG in the conversion procedure instead.
+5. **Cortex Search:** `CREATE CORTEX SEARCH SERVICE … ON index_text … EMBEDDING_MODEL =
    'snowflake-arctic-embed-l-v2.0'` with a `QUALIFY` in the source query is accepted, and
    `SNOWFLAKE.CORTEX.SEARCH_PREVIEW('<db>.<schema>.document_search', '{"query": …}')`
    returns results. For production traffic, Snowflake recommends the Python/REST API of
    the service; switching `core/search.py` to it is a small change.
-5. **Column-level lineage** appears for `document_text.content`, the `document_enrichment`
-   columns and `search_corpus.text` (Snowsight lineage or
-   `SNOWFLAKE.ACCOUNT_USAGE.ACCESS_HISTORY`, Enterprise edition or higher).
-6. `@st.cache_data` is shared across viewers on the compute pool (check `QUERY_HISTORY`
+6. **Column-level lineage** appears for the `page_ocr` columns, `document_text.content` and
+   the `document_enrichment` columns (Snowsight lineage or
+   `SNOWFLAKE.ACCOUNT_USAGE.ACCESS_HISTORY`, Enterprise edition or higher). The Python
+   conversion step itself is not traced column by column; lineage starts at
+   `pdf_page.stage_path`.
+7. `@st.cache_data` is shared across viewers on the compute pool (check `QUERY_HISTORY`
    after opening the app as two users).

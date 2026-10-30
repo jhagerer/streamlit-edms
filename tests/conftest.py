@@ -3,7 +3,7 @@
 The tables are generated from core/schema.py with the same primary keys as the
 hybrid tables in sql/minidms-setup.sql, so primary-key violations, version
 checks and transaction rollbacks behave for real. Snowflake-only statements
-(SHOW, information_schema, the token probe, SEARCH, stage commands) are
+(SHOW, information_schema, the token probe, Cortex Search, stage commands) are
 answered by small patterns. No Snowflake needed.
 """
 
@@ -23,7 +23,7 @@ from snowflake.snowpark import Row
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core import schema  # noqa: E402
+from core import schema, setup  # noqa: E402
 
 def _current(table: str, key: str, cols: str, created: bool = True) -> str:
     created_cols = (f", (SELECT event_ts FROM {table} f WHERE {_eq(key, 'f')} AND f.version = 1) "
@@ -69,7 +69,7 @@ VIEWS_SQL = [
                   ROW_NUMBER() OVER (PARTITION BY file_id ORDER BY requested_at DESC, event_id DESC) AS rn
                   FROM ai_request) WHERE rn = 1)
        SELECT r.file_id, r.requested_at, t.status AS text_status, t.error AS text_error,
-              t.extracted_at, LENGTH(t.content) AS chars, e.status AS enrich_status,
+              t.extracted_at, LENGTH(t.content) AS chars, t.pages, e.status AS enrich_status,
               e.error AS enrich_error, e.created_at AS enriched_at,
               NOT EXISTS (SELECT 1 FROM ai_job_log j WHERE j.request_id = r.request_id
                           AND j.step = 'finished') AS pending
@@ -91,6 +91,8 @@ VIEWS_SQL = [
        UNION ALL SELECT event_ts, actor, op, 'metadata_type', NULL, metadata_type_id FROM metadata_type_log
        UNION ALL SELECT event_ts, actor, op, 'tag_definition', NULL, tag_id FROM tag_log
        UNION ALL SELECT uploaded_at, uploaded_by, 'upload', 'stored_file', document_id, file_id FROM stored_file
+       UNION ALL SELECT created_at, 'system:ai', 'convert_' || status, 'pdf_conversion', NULL, file_id
+       FROM pdf_conversion
        UNION ALL SELECT extracted_at, actor, 'ocr_' || status, 'document_text', NULL, file_id FROM document_text
        UNION ALL SELECT created_at, actor, 'enrich_' || status, 'document_enrichment', document_id, file_id
        FROM document_enrichment""",
@@ -174,16 +176,17 @@ class FakeSession:
         self.closed = True
 
     def _search_preview(self, q: str) -> str:
-        """Stand-in for Cortex Search: words of the query matched against the
-        latest run per file in search_corpus, best (most words) first."""
+        """Stand-in for Cortex Search: words of the query matched against
+        index_text of the latest successful run per file in page_ocr, best
+        (most words) first — one search document per page."""
         m = re.search(r"SEARCH_PREVIEW\('(.*?)', '(.*)'\)$", q, re.S)
         request = json.loads(m.group(2).replace("''", "'").replace("\\\\", "\\"))
         self.search_requests.append(request)
-        rows = self.rows("SELECT * FROM search_corpus c WHERE run_id = (SELECT run_id FROM "
-                         "search_corpus d WHERE d.file_id = c.file_id ORDER BY created_at DESC "
-                         "LIMIT 1)")
+        rows = self.rows("SELECT * FROM page_ocr c WHERE status = 'done' AND run_id = (SELECT "
+                         "run_id FROM page_ocr d WHERE d.file_id = c.file_id AND d.status = "
+                         "'done' ORDER BY created_at DESC LIMIT 1) ORDER BY file_id, page_no")
         words = [w.lower() for w in request["query"].split()]
-        scored = [(sum(w in (r["text"] or "").lower() for w in words), r) for r in rows]
+        scored = [(sum(w in (r["index_text"] or "").lower() for w in words), r) for r in rows]
         hits = [r for n, r in sorted(scored, key=lambda x: -x[0]) if n]
         return json.dumps({"results": [{c: r[c] for c in request["columns"]}
                                        for r in hits[:request["limit"]]]})
@@ -243,7 +246,7 @@ class FakeSession:
         if "INFORMATION_SCHEMA.STAGES" in up:
             return _Result([] if self.schema_missing else [("doc_files",)])
         if "INFORMATION_SCHEMA.PROCEDURES" in up:
-            return _Result([] if self.schema_missing else [("process_ai",)])
+            return _Result([] if self.schema_missing else [(p,) for p in setup.PROCEDURES])
         if "TASK_HISTORY" in up:
             return _Result([], arrow=pa.table({"STATE": pa.array([], pa.string())}))
         if up.startswith(("CREATE", "GRANT", "USE ", "ALTER", "EXECUTE")) or "FROM VALUES" in up:

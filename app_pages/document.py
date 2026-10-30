@@ -224,10 +224,32 @@ with tab_files:
 
 # ── Text & AI ────────────────────────────────────────────────────────────────
 
+
+def _page_details(pages: pl.DataFrame, key: str) -> None:
+    """One page of the structured OCR: summary, headings, images, tables, text."""
+    no = st.selectbox("Page", pages["page_no"].to_list(), key=key)
+    page = pages.filter(pl.col("page_no") == no).row(0, named=True)
+    if page["status"] != "done":
+        st.error(f"OCR of this page failed. {page['error'] or ''}")
+        return
+    if page["page_short_summary"]:
+        st.markdown(f"**Summary:** {page['page_short_summary']}")
+    for label, column in (("Headings", "headings_list"),
+                          ("Images", "image_short_summaries_list"),
+                          ("Tables", "table_summaries_list")):
+        items = model.parse_list(page[column])
+        if items:
+            st.markdown(f"**{label}**\n" + "\n".join(f"- {x}" for x in items))
+    st.text_area("Page text", page["ocr_text"] or "", height=200, disabled=True,
+                 key=f"{key}:text:{no}")
+
+
 with tab_ai:
-    st.caption("After an upload, Snowflake runs AI_COMPLETE (claude-sonnet-4-5) for the OCR "
-               "text, a summary, type and tag suggestions and metadata extraction. The results "
-               "are lineage-linked to the file. Suggestions change nothing until you apply them.")
+    st.caption("After an upload, Snowflake converts the file to PDF, splits it into pages and "
+               "reads every page with AI_COMPLETE (claude-haiku-4-5): text, headings, image and "
+               "table summaries, page summary. Then AI_COMPLETE (claude-sonnet-4-5) writes a "
+               "summary, type and tag suggestions and metadata. The results are lineage-linked "
+               "to the file. Suggestions change nothing until you apply them.")
     texts = read.load_texts(tuple(doc_files["file_id"].to_list()),
                             _state.tokens()["document_text"])
     enrich_all = _state.table("document_enrichment_current")
@@ -245,11 +267,16 @@ with tab_ai:
             {"failed": st.error, "missing": st.warning}.get(state, st.caption)(msg)
 
             txt = texts.filter(pl.col("file_id") == f["file_id"])
-            if txt.height and txt["status"][0] == "done":
-                with st.expander(f"OCR text ({len(txt['content'][0] or '')} characters)"):
-                    st.text_area("OCR text", txt["content"][0] or "", height=300, disabled=True,
+            if txt.height and txt["content"][0]:
+                with st.expander(f"OCR text ({txt['pages'][0] or 0} pages, "
+                                 f"{len(txt['content'][0])} characters)"):
+                    st.text_area("OCR text", txt["content"][0], height=300, disabled=True,
                                  key=f"doc:{doc_id}:text:{f['file_id']}",
                                  label_visibility="collapsed")
+                pages = read.load_pages(f["file_id"], _state.tokens()["page_ocr"])
+                if pages.height:
+                    with st.expander("Pages (what the search indexes)"):
+                        _page_details(pages, f"doc:{doc_id}:page:{f['file_id']}")
 
             enr = enrich_all.filter(pl.col("file_id") == f["file_id"])
             enr_row = enr.row(0, named=True) if enr.height else None

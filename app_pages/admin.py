@@ -14,7 +14,8 @@ tab_ai, tab_counts, tab_orphans, tab_cost = st.tabs(
 with tab_ai:
     st.caption("Uploads append to `ai_request`; the stream `ai_request_stream` fires the "
                "triggered task `process_ai_task` on its warehouse, which runs "
-               f"`process_ai()`: OCR and enrichment with AI_COMPLETE ({ai.MODEL}).")
+               "`process_ai()`: conversion to PDF pages, OCR per page with AI_COMPLETE "
+               f"({ai.PAGE_MODEL}) and enrichment ({ai.MODEL}).")
     try:
         task = ai.task_state()
     except Exception as exc:

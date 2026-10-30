@@ -11,7 +11,7 @@ session; it caches *query results* where that is cheap and safe:
   no counters to maintain. One query per rerun reads all of them.
 * A TTL is an extra safety net.
 
-document_text (large OCR text), the search corpus and the history are never
+document_text and page_ocr (large OCR text) and the history are never
 bulk-loaded; they are queried per document (search: Cortex Search).
 """
 
@@ -84,6 +84,17 @@ def load_texts(file_ids: tuple[str, ...], token: str) -> pl.DataFrame:
         params=list(file_ids),
     )
     return schema.conform("document_text_current", df)
+
+
+@cache_data(ttl=CACHE_TTL)
+def load_pages(file_id: str, token: str) -> pl.DataFrame:
+    """Structured OCR of every page of one file, from its latest run."""
+    df = db.query_frame(
+        "SELECT * FROM page_ocr WHERE file_id = ? AND run_id = (SELECT run_id FROM page_ocr "
+        "WHERE file_id = ? ORDER BY created_at DESC LIMIT 1) ORDER BY page_no",
+        params=[file_id, file_id],
+    )
+    return schema.conform("page_ocr", df)
 
 
 @cache_data(ttl=CACHE_TTL)

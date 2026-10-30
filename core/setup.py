@@ -31,7 +31,7 @@ WAREHOUSES = ("minidms_wh",)
 STAGES = ("doc_files",)
 VIEWS = SCHEMA_VIEWS
 STREAMS = ("ai_request_stream",)
-PROCEDURES = ("process_ai",)
+PROCEDURES = ("convert_to_pdf_pages", "ocr_pages", "process_ai")
 TASKS = ("process_ai_task",)
 SEARCH_SERVICES = ("document_search",)
 
@@ -208,8 +208,9 @@ def steps(text: str | None = None) -> list[Step]:
              "can run on any warehouse. Needs CREATE WAREHOUSE.",
              by_kind("warehouse")),
         Step("stage", "Stage",
-             "`@doc_files` holds uploaded files at `{checksum}/{filename}` (with a directory "
-             "table and server-side encryption, which AI_COMPLETE needs to read them).",
+             "`@doc_files` holds uploaded files at `{checksum}/{filename}` and the derived PDFs "
+             "at `{checksum}/derived/` (with a directory table and server-side encryption, "
+             "which AI_COMPLETE needs to read them).",
              by_kind("stage")),
         Step("hybrid", "Hybrid tables (what people edit, append-only)",
              "Documents, metadata values, tag assignments, file attachments and the "
@@ -217,10 +218,10 @@ def steps(text: str | None = None) -> list[Step]:
              "PRIMARY KEY (id, version) makes concurrent edits collide instead of overwriting "
              "each other; UNIQUE (event_id) makes every action idempotent.",
              by_kind("hybrid")),
-        Step("standard", "Standard tables (files, AI output, search corpus)",
-             "Uploaded files, AI requests, OCR text, enrichments and the search corpus: "
-             "append-only and written by INSERT … SELECT inside Snowflake, so they carry "
-             "column-level lineage.",
+        Step("standard", "Standard tables (files, pages, AI output)",
+             "Uploaded files, AI requests, the PDF conversion and pages, the structured OCR per "
+             "page, the text and the enrichments: append-only; the AI output is written by "
+             "INSERT … SELECT inside Snowflake, so it carries column-level lineage.",
              by_kind("table")),
         Step("views", "Views",
              "The current state (latest version per key), the latest OCR text and enrichment "
@@ -229,16 +230,18 @@ def steps(text: str | None = None) -> list[Step]:
              by_kind("view")),
         Step("pipeline", "AI pipeline (stream + triggered task)",
              "A stream on `ai_request` fires the triggered task on `minidms_wh` right after a "
-             "file is uploaded; it calls `process_ai()`: AI_COMPLETE (claude-sonnet-4-5) for "
-             "OCR, summary, type and tag suggestions and metadata extraction, then the text "
-             "chunks and summary go to `search_corpus`. The owning role needs CREATE "
-             "STREAM/TASK/PROCEDURE, EXECUTE TASK, USAGE on the warehouse and "
-             "SNOWFLAKE.CORTEX_USER. The last statement resumes the task.",
+             "file is uploaded; it calls `process_ai()`: every file is converted to PDF and "
+             "split into pages (Python procedure), every page gets a structured OCR with "
+             "AI_COMPLETE (claude-haiku-4-5) into `page_ocr`, then AI_COMPLETE "
+             "(claude-sonnet-4-5) writes the summary, type and tag suggestions and metadata. "
+             "The owning role needs CREATE STREAM/TASK/PROCEDURE, EXECUTE TASK, USAGE on the "
+             "warehouse, SNOWFLAKE.CORTEX_USER and the Anaconda terms accepted. The last "
+             "statement resumes the task.",
              by_kind("stream", "procedure", "task", "resume")),
         Step("search", "Cortex Search (the sink of the pipeline)",
-             "The service `document_search` indexes the latest run of every file in "
-             "`search_corpus` and refreshes itself (target lag 1 minute). The Search page "
-             "queries it. Needs CREATE CORTEX SEARCH SERVICE and CORTEX_USER.",
+             "The service `document_search` indexes one search document per page from "
+             "`page_ocr` (summary, headings, image and table summaries — not the raw OCR text) "
+             "and refreshes itself (target lag 1 minute). The Search page queries it. Needs CREATE CORTEX SEARCH SERVICE and CORTEX_USER.",
              by_kind("search")),
     ]
     if other:

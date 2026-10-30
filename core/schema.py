@@ -5,8 +5,9 @@ append-only:
 
 * hybrid tables — everything people edit; one row per version, the current
   state is the latest version per key (the *_current views);
-* standard tables — immutable facts and AI output (lineage), plus the search
-  corpus that feeds the Cortex Search service.
+* standard tables — immutable facts and AI output (lineage): the files, their
+  PDF pages and the structured OCR per page that feeds the Cortex Search
+  service.
 
 Every frame the app loads goes through ``conform()`` so dtypes are pinned in
 one place.
@@ -31,9 +32,11 @@ HYBRID_TABLES: tuple[str, ...] = (
 STANDARD_TABLES: tuple[str, ...] = (
     "stored_file",
     "ai_request",
+    "pdf_conversion",
+    "pdf_page",
+    "page_ocr",
     "document_text",
     "document_enrichment",
-    "search_corpus",
     "ai_job_log",
 )
 
@@ -59,8 +62,8 @@ SEARCH_SERVICE = "document_search"
 TOKEN_TABLES: tuple[str, ...] = HYBRID_TABLES + STANDARD_TABLES
 
 # Views the app bulk-loads (small: one row per entity or per file), with the
-# tables whose change tokens they depend on. document_text (the large OCR text),
-# the search corpus and the history are never bulk-loaded.
+# tables whose change tokens they depend on. document_text and page_ocr (the
+# large OCR text) and the history are never bulk-loaded.
 LOADED: dict[str, tuple[str, ...]] = {
     "document_type_current": ("document_type_log",),
     "metadata_type_current": ("metadata_type_log",),
@@ -119,16 +122,26 @@ COLUMNS: dict[str, dict[str, pl.DataType]] = {
     },
     "document_text": {
         "event_id": S, "extracted_at": TS, "actor": S, "file_id": S, "model": S, "status": S,
-        "content": S, "error": S,
+        "pages": I, "content": S, "error": S,
     },
     "document_enrichment": {
         "event_id": S, "created_at": TS, "actor": S, "file_id": S, "document_id": S,
         "model": S, "status": S, "summary": S, "suggested_type_id": S,
         "suggested_tag_ids": S, "extracted_metadata": S, "error": S,   # ARRAYs arrive as JSON text
     },
-    "search_corpus": {
+    "pdf_conversion": {
+        "event_id": S, "created_at": TS, "run_id": S, "file_id": S, "status": S,
+        "converter": S, "pdf_path": S, "page_count": I, "error": S,
+    },
+    "pdf_page": {
+        "event_id": S, "created_at": TS, "run_id": S, "file_id": S, "page_no": I,
+        "stage_path": S,
+    },
+    "page_ocr": {
         "event_id": S, "created_at": TS, "run_id": S, "file_id": S, "document_id": S,
-        "filename": S, "kind": S, "chunk_no": I, "text": S,
+        "filename": S, "page_no": I, "model": S, "status": S, "ocr_text": S,
+        "headings_list": S, "image_short_summaries_list": S, "table_summaries_list": S,
+        "page_short_summary": S, "index_text": S, "error": S,
     },
     "ai_job_log": {
         "event_id": S, "event_ts": TS, "request_id": S, "file_id": S, "document_id": S,
@@ -154,7 +167,7 @@ COLUMNS: dict[str, dict[str, pl.DataType]] = {
                                "assigned_at": TS, "assigned_by": S},
     "ai_status_v": {
         "file_id": S, "requested_at": TS, "text_status": S, "text_error": S,
-        "extracted_at": TS, "chars": I, "enrich_status": S, "enrich_error": S,
+        "extracted_at": TS, "chars": I, "pages": I, "enrich_status": S, "enrich_error": S,
         "enriched_at": TS, "pending": B,
     },
     "document_history_v": {
@@ -167,7 +180,8 @@ COLUMNS["document_enrichment_current"] = COLUMNS["document_enrichment"]
 
 DOCUMENT_STATUSES = ("active", "trashed")
 DATA_TYPES = ("text", "number", "date", "choice")
-AI_MODEL = "claude-sonnet-4-5"
+OCR_MODEL = "claude-haiku-4-5"      # structured OCR per page
+AI_MODEL = "claude-sonnet-4-5"      # enrichment per file
 
 
 def columns(table: str) -> list[str]:

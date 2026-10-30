@@ -44,9 +44,9 @@ def seed(fake):
     fake.stage[stored(name="a.txt")["stage_path"].lstrip("@")] = b"hello"
     # What process_ai() would have written inside Snowflake:
     fake.conn.execute(
-        "INSERT INTO document_text (event_id, extracted_at, actor, file_id, model, status, content) "
-        "VALUES ('t1', '2020-01-02 00:00:00.000000', 'system:ai', 'f1', 'claude-sonnet-4-5', "
-        "'done', 'Invoice no. 42, total 99 EUR')")
+        "INSERT INTO document_text (event_id, extracted_at, actor, file_id, model, status, pages, "
+        "content) VALUES ('t1', '2020-01-02 00:00:00.000000', 'system:ai', 'f1', "
+        "'claude-haiku-4-5', 'done', 1, '--- Page 1 ---\nInvoice no. 42, total 99 EUR')")
     fake.conn.execute(
         "INSERT INTO document_enrichment (event_id, created_at, actor, file_id, document_id, model, "
         "status, summary, suggested_type_id, suggested_tag_ids, extracted_metadata) VALUES "
@@ -57,10 +57,13 @@ def seed(fake):
     fake.conn.execute("INSERT INTO ai_job_log (event_id, event_ts, request_id, file_id, "
                       "document_id, step) VALUES ('j1', '2020-01-02 00:00:02.000000', ?, 'f1', "
                       "'d1', 'finished')", [req])
-    fake.conn.execute("INSERT INTO search_corpus (event_id, created_at, run_id, file_id, "
-                      "document_id, filename, kind, chunk_no, text) VALUES ('c1', "
-                      "'2020-01-02 00:00:02.000000', ?, 'f1', 'd1', 'a.txt', 'text', 0, "
-                      "'Invoice no. 42, total 99 EUR')", [req])
+    fake.conn.execute("INSERT INTO page_ocr (event_id, created_at, run_id, file_id, document_id, "
+                      "filename, page_no, model, status, ocr_text, headings_list, "
+                      "image_short_summaries_list, table_summaries_list, page_short_summary, "
+                      "index_text) VALUES ('p1', '2020-01-02 00:00:00.000000', ?, 'f1', 'd1', "
+                      "'a.txt', 1, 'claude-haiku-4-5', 'done', 'Invoice no. 42, total 99 EUR', "
+                      "'[\"Invoice\"]', '[\"ACME logo\"]', '[]', 'Invoice 42 over 99 EUR.', "
+                      "'Invoice 42 over 99 EUR.\nInvoice\nACME logo')", [req])
 
 
 @pytest.mark.parametrize("page", PAGES)
@@ -167,7 +170,7 @@ def test_search_uses_cortex_search(fake):
     assert not at.exception, at.exception
     grid = at.dataframe[0].value
     assert grid["label"].tolist() == ["Invoice 42"]
-    assert "99 EUR" in grid["match"].iloc[0]                  # best matching chunk shown
+    assert grid["match"].iloc[0] == "p. 1: Invoice 42 over 99 EUR."   # best matching page
     assert fake.search_requests[-1]["query"] == "EUR"
     at.text_input(key="search:q").input("nothing-matches").run()
     assert any("No matching documents" in i.value for i in at.info)
@@ -336,3 +339,15 @@ def test_concurrent_metadata_edit_is_a_conflict(fake):
     assert any("changed by someone else" in e.value for e in at.error)
     assert fake.rows("SELECT value FROM metadata_current") == [{"value": "13"}]
     assert at.text_input(key="doc:d1:meta:m1").value == "13"  # draft reset to the latest
+
+
+def test_text_tab_shows_structured_pages(fake):
+    seed(fake)
+    at = app()
+    at.query_params["doc"] = "d1"
+    at.switch_page("app_pages/document.py").run()
+    assert not at.exception, at.exception
+    assert [s.value for s in at.selectbox if s.label == "Page"] == [1]
+    shown = " ".join(m.value for m in at.markdown)
+    assert "Invoice 42 over 99 EUR." in shown and "ACME logo" in shown
+    assert any(t.value == "Invoice no. 42, total 99 EUR" for t in at.text_area)

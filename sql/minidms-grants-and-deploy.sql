@@ -13,9 +13,12 @@ GRANT USAGE ON DATABASE <db> TO ROLE <schema_owner_role>;
 GRANT USAGE, CREATE TABLE, CREATE HYBRID TABLE, CREATE VIEW, CREATE STAGE, CREATE STREAM,
       CREATE TASK, CREATE PROCEDURE, CREATE CORTEX SEARCH SERVICE
       ON SCHEMA <db>.<schema> TO ROLE <schema_owner_role>;
-GRANT DATABASE ROLE SNOWFLAKE.CORTEX_USER TO ROLE <schema_owner_role>;   -- AI_COMPLETE, SPLIT_TEXT…
+GRANT DATABASE ROLE SNOWFLAKE.CORTEX_USER TO ROLE <schema_owner_role>;   -- AI_COMPLETE
 -- As ACCOUNTADMIN: run and resume tasks.
 GRANT EXECUTE TASK ON ACCOUNT TO ROLE <schema_owner_role>;
+-- The procedure convert_to_pdf_pages() uses pypdf, Pillow and reportlab from
+-- Snowflake's Anaconda channel: an ORGADMIN accepts the Anaconda terms once
+-- (Snowsight → Admin → Billing & Terms).
 
 -- ── App role (if different from the owner): what the app exercises, no more ──
 -- Every table is append-only, and the grants enforce it: SELECT and INSERT,
@@ -37,9 +40,11 @@ GRANT SELECT, INSERT ON TABLE <db>.<schema>.tag_assignment_log TO ROLE <app_role
 -- Standard tables: the app appends uploads and AI requests, and only reads AI output.
 GRANT SELECT, INSERT ON TABLE <db>.<schema>.stored_file         TO ROLE <app_role>;
 GRANT SELECT, INSERT ON TABLE <db>.<schema>.ai_request          TO ROLE <app_role>;
+GRANT SELECT         ON TABLE <db>.<schema>.pdf_conversion      TO ROLE <app_role>;
+GRANT SELECT         ON TABLE <db>.<schema>.pdf_page            TO ROLE <app_role>;
+GRANT SELECT         ON TABLE <db>.<schema>.page_ocr            TO ROLE <app_role>;
 GRANT SELECT         ON TABLE <db>.<schema>.document_text       TO ROLE <app_role>;
 GRANT SELECT         ON TABLE <db>.<schema>.document_enrichment TO ROLE <app_role>;
-GRANT SELECT         ON TABLE <db>.<schema>.search_corpus       TO ROLE <app_role>;
 GRANT SELECT         ON TABLE <db>.<schema>.ai_job_log          TO ROLE <app_role>;
 GRANT SELECT ON ALL VIEWS IN SCHEMA <db>.<schema> TO ROLE <app_role>;
 -- Search page: query the Cortex Search service.

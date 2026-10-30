@@ -1,11 +1,13 @@
 """Search with Cortex Search — the sink of the ingest pipeline.
 
-process_ai() (sql/minidms-setup.sql) splits each file's OCR text into chunks
-and appends them, plus the AI summary, to search_corpus; the Cortex Search
-service document_search indexes that table and keeps itself up to date. The
-app sends the query to the service and gets back the best-matching chunks with
-their document_id and file_id. Hybrid keyword + semantic matching, ranked by
-relevance. Type, tag and trash filters are applied afterwards in polars.
+process_ai() (sql/minidms-setup.sql) converts every file to PDF, splits it
+into pages and writes a structured OCR per page to page_ocr. The Cortex Search
+service document_search indexes one search document per page: its index_text
+(page summary, headings, image and table summaries — not the raw OCR text).
+The app sends the query to the service and gets back the best-matching pages
+with their document_id, file_id and page number. Hybrid keyword + semantic
+matching, ranked by relevance. Type, tag and trash filters are applied
+afterwards in polars.
 """
 
 from __future__ import annotations
@@ -16,15 +18,15 @@ from dataclasses import dataclass
 from core import db
 from core.schema import SEARCH_SERVICE
 
-COLUMNS = ["document_id", "file_id", "kind", "text"]
+COLUMNS = ["document_id", "file_id", "page_no", "page_short_summary", "index_text"]
 
 
 @dataclass
 class Hit:
     document_id: str
     file_id: str
-    kind: str      # text | summary
-    text: str      # the matching chunk
+    page_no: int | None
+    text: str      # the page's short summary (or its index text)
 
 
 def _literal(value: str) -> str:
@@ -53,8 +55,15 @@ def search(query: str, database: str, schema: str, limit: int = 50, session=None
            f"{_literal(service_name(database, schema))}, {_literal(request_json(query, limit))})")
     raw = db.query(sql, session=session)[0][0]
     results = json.loads(raw).get("results", []) if raw else []
-    return [Hit(str(r.get("document_id")), str(r.get("file_id")), str(r.get("kind") or "text"),
-                str(r.get("text") or "")) for r in results]
+    return [Hit(str(r.get("document_id")), str(r.get("file_id")), _int(r.get("page_no")),
+                str(r.get("page_short_summary") or r.get("index_text") or "")) for r in results]
+
+
+def _int(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def ranked_document_ids(hits: list[Hit], active_file_ids: set[str] | None = None) -> list[str]:
@@ -70,10 +79,12 @@ def ranked_document_ids(hits: list[Hit], active_file_ids: set[str] | None = None
 
 
 def best_snippets(hits: list[Hit], width: int = 220) -> dict[str, str]:
-    """document_id -> the text of its best hit, shortened. Pure."""
+    """document_id -> its best page ("p. 3: summary"), shortened. Pure."""
     out: dict[str, str] = {}
     for h in hits:
         if h.document_id not in out:
             text = " ".join(h.text.split())
+            if h.page_no is not None:
+                text = f"p. {h.page_no}: {text}"
             out[h.document_id] = text if len(text) <= width else text[:width - 1] + "…"
     return out

@@ -73,8 +73,9 @@ if submitted:
                                       f"— use “Process again” on the document. ({exc})")
                     created += 1
             if ok and not files.extractable(up.name):
-                _state.flash(f"{up.name}: no text extraction for this file type — the "
-                             "document is stored, but its content is not searchable.", "info")
+                _state.flash(f"{up.name}: this file type is not converted to PDF (supported: "
+                             "PDF, images, plain text) — the document is stored, but its "
+                             "content is not searchable.", "info")
             progress.progress(i / len(uploaded))
         for msg in failed:
             _state.flash(msg, "error")
