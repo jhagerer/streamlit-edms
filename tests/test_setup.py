@@ -33,7 +33,7 @@ def test_setup_script_covers_every_object():
     assert all(s.kind for s in stmts), [s.sql[:40] for s in stmts if not s.kind]
     assert [st.key for st in setup.steps()] == ["warehouse", "stage", "hybrid", "standard",
                                                 "views", "pipeline", "search"]
-    assert setup.total_needed() == 1 + 1 + 7 + 8 + 12 + 1 + 3 + 1 + 1 + 1
+    assert setup.total_needed() == 1 + 1 + 7 + 8 + 12 + 1 + 4 + 3 + 1 + 1 + 1
 
 
 def _columns(sql: str) -> list[str]:
@@ -102,9 +102,9 @@ def test_pipeline_is_triggered_and_lineage_friendly():
         assert "AI_PARSE_DOCUMENT" not in proc and "VALUES" not in proc, name
     proc = by[("procedure", "process_ai")]
     assert "FROM ai_request_stream" in proc
-    assert "CALL convert_to_pdf_pages(:v_req, :v_fid)" in proc
-    assert "CALL ocr_pages(:v_req, :v_fid, :v_doc, 1, 1000000)" in proc
-    assert "CALL ocr_pages(:v_req, :v_fid, :v_doc, :v_page, :v_page)" in proc   # per-page retry
+    assert "CALL convert_to_pdf_pages(:v_fid)" in proc
+    assert "CALL ocr_pages(:v_req, :v_fid, 1, 1000000)" in proc
+    assert "CALL ocr_pages(:v_req, :v_fid, :v_page, :v_page)" in proc           # per-page retry
     # Lineage: AI output is written with INSERT … SELECT from its sources.
     text = proc[proc.index("INSERT INTO document_text"):]
     assert text.index("LISTAGG(") < text.index("FROM page_ocr o")
@@ -112,7 +112,8 @@ def test_pipeline_is_triggered_and_lineage_friendly():
     assert "'claude-sonnet-4-5'" in enrich
     assert enrich.index("AI_COMPLETE(") < enrich.index("FROM document_text_current t")
     written = set(re.findall(r"INSERT INTO (\w+)", proc))
-    assert written == {"ai_job_log", "page_ocr", "document_text", "document_enrichment"}
+    assert written == {"ai_job_log", "pdf_conversion", "pdf_page", "page_ocr", "document_text",
+                       "document_enrichment"}
     # Page OCR: Haiku, one structured AI_COMPLETE per single-page PDF.
     ocr = by[("procedure", "ocr_pages")]
     assert set(re.findall(r"INSERT INTO (\w+)", ocr)) == {"page_ocr"}
@@ -126,22 +127,51 @@ def test_pipeline_is_triggered_and_lineage_friendly():
     index = ocr[ocr.index("ARRAY_CONSTRUCT_COMPACT("):ocr.index("IFF(y.ocr_text IS NULL, 'No")]
     assert "ocr_text" not in index                   # index_text = everything but ocr_text
     assert all(f in index for f in ("page_summary", "headings", "images", "tables"))
-    # Conversion: Python, writes only pdf_conversion and pdf_page.
+    # Conversion: Python writes files only; the rows come from INSERT … SELECT.
     conv = by[("procedure", "convert_to_pdf_pages")]
     assert "LANGUAGE PYTHON" in conv and "'pypdf'" in conv
-    assert set(re.findall(r"INSERT INTO (\w+)", conv)) == {"pdf_conversion"}
-    assert 'save_as_table("pdf_page"' in conv and "/derived" in conv
+    assert "INSERT" not in conv and "save_as_table" not in conv
+    assert "pdf_path(stage_path, checksum)" in conv and "pdf_page_path(?" in conv
+    pages = proc[proc.index("INSERT INTO pdf_page"):]
+    assert pages.index("pdf_page_path(f.checksum") < pages.index("FROM pdf_conversion c")
+    conversion = proc[proc.index("INSERT INTO pdf_conversion"):]
+    assert conversion.index("pdf_page_count(pdf_path(f.stage_path") < conversion.index(
+        "FROM ai_request r")
     order = [(s.kind, s.name) for s in stmts]
     assert order.index(("table", "ai_request")) < order.index(("stream", "ai_request_stream"))
     assert order.index(("procedure", "ocr_pages")) < order.index(("procedure", "process_ai"))
+    for fn in setup.FUNCTIONS:          # functions exist before the procedures use them
+        assert order.index(("function", fn)) < order.index(("procedure", "convert_to_pdf_pages"))
     assert order.index(("task", "process_ai_task")) < order.index(("resume", "process_ai_task"))
 
 
-def test_conversion_code_compiles():
+def test_python_code_compiles():
     by = {(s.kind, s.name): s.sql for s in setup.setup_statements()}
-    conv = by[("procedure", "convert_to_pdf_pages")]
-    code = conv[conv.index("$$") + 2:conv.rindex("$$")]
-    compile(code, "convert_to_pdf_pages", "exec")
+    for key in (("procedure", "convert_to_pdf_pages"), ("function", "pdf_page_count")):
+        code = by[key][by[key].index("$$") + 2:by[key].rindex("$$")]
+        compile(code, key[1], "exec")
+
+
+def test_pipeline_writes_have_column_lineage():
+    """Every pipeline row is an INSERT … SELECT whose values come from source
+    columns: procedure variables only filter rows (WHERE … = :v) or carry an
+    error message — never a data value, which would cut the lineage."""
+    by = {(s.kind, s.name): s.sql for s in setup.setup_statements()}
+    for name in ("process_ai", "ocr_pages"):
+        proc = re.sub(r"'(?:[^']|'')*'", "''", by[("procedure", name)])   # drop string literals
+        inserts = re.findall(r"INSERT INTO \w+.*?;", proc, re.S)
+        assert inserts, name
+        for stmt in inserts:
+            assert re.search(r"\)\s*SELECT\b", stmt), stmt[:80]       # never VALUES
+            for line in stmt.splitlines():
+                for var in re.findall(r"(?<![:\w]):([a-z_]\w*)", line):   # not ::cast, j:key
+                    if var in ("v_msg", "v_err"):                   # error text only
+                        continue
+                    assert re.search(rf"(=|<>|BETWEEN|AND)\s*:{var}\b", line), (name, line)
+        # Every data INSERT reads a pipeline source, not just constants.
+        for stmt in inserts:
+            assert re.search(r"\bFROM (ai_request|ai_request_stream|stored_file|pdf_page|"
+                             r"pdf_conversion|page_ocr|document_text_current)\b", stmt), stmt[:80]
 
 
 def test_cortex_search_service_is_the_sink():

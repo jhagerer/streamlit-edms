@@ -3,8 +3,8 @@
 --
 -- Everything the app needs: a warehouse (created only if missing), one stage,
 -- seven hybrid tables, eight standard tables, a dozen views, the AI pipeline
--- (one stream, three procedures, one triggered task) and one Cortex Search
--- service.
+-- (one stream, four functions, three procedures, one triggered task) and one
+-- Cortex Search service.
 -- Run once in the database and schema you already use.
 --
 -- One global state, in Snowflake only, and EVERY table is append-only — the
@@ -21,10 +21,11 @@
 --                     action fail as a whole, so it is never applied twice.
 --   Standard tables — immutable facts and AI output: uploaded files, AI
 --                     requests, the PDF pages, the structured OCR per page,
---                     the text and the enrichments. The AI output is written
---                     by INSERT … SELECT inside Snowflake, so Snowflake records
---                     column-level lineage from the page file to the OCR
---                     fields, the text, the summary and the suggestions.
+--                     the text and the enrichments. Every pipeline row is
+--                     written by INSERT … SELECT from its sources inside
+--                     Snowflake, so Snowflake records column-level lineage from
+--                     the upload to the pages, the OCR fields, the text, the
+--                     summary and the suggestions (see the AI pipeline section).
 --   Cortex Search   — the sink of the ingest pipeline: every file is converted
 --                     to PDF and split into pages, every page gets a
 --                     structured OCR (AI_COMPLETE, claude-haiku-4-5), and the
@@ -37,7 +38,7 @@
 --
 -- Privileges the owning role needs: CREATE WAREHOUSE (account, only if
 -- minidms_wh does not exist), CREATE TABLE / HYBRID TABLE / VIEW / STAGE /
--- STREAM / TASK / PROCEDURE / CORTEX SEARCH SERVICE (schema), EXECUTE TASK
+-- STREAM / TASK / FUNCTION / PROCEDURE / CORTEX SEARCH SERVICE (schema), EXECUTE TASK
 -- (account) and the SNOWFLAKE.CORTEX_USER database role. The Python procedure
 -- uses pypdf, Pillow and reportlab from Snowflake's Anaconda channel (accept the
 -- Anaconda terms once per account).
@@ -435,7 +436,7 @@ UNION ALL SELECT created_at,   'system:ai', 'convert_' || status, 'pdf_conversio
 UNION ALL SELECT extracted_at, actor,       'ocr_' || status,    'document_text',       NULL,        file_id FROM document_text
 UNION ALL SELECT created_at,   actor,       'enrich_' || status, 'document_enrichment', document_id, file_id FROM document_enrichment;
 
--- ── AI pipeline: stream + procedures + triggered task ────────────────────────
+-- ── AI pipeline: stream + functions + procedures + triggered task ────────────
 --
 -- Saving an upload (or "process again") appends to ai_request. The stream sees
 -- it, which fires the triggered task on minidms_wh, which calls process_ai():
@@ -444,8 +445,12 @@ UNION ALL SELECT created_at,   actor,       'enrich_' || status, 'document_enric
 --   2. per queued request:
 --      a. pages — reuse the page OCR of an identical file (same checksum, not
 --         on "process again"), or
---         · convert_to_pdf_pages(): convert the file to PDF and split it into
---           single-page PDFs on the stage (Python: pypdf, Pillow, reportlab);
+--         · convert_to_pdf_pages(): write the file as PDF and one PDF per page
+--           to the stage (Python: pypdf, Pillow, reportlab). Files only — it
+--           writes no table rows;
+--         · record the conversion and the pages with INSERT … SELECT FROM
+--           stored_file / pdf_conversion (the page count is read from the PDF
+--           by the UDF pdf_page_count());
 --         · ocr_pages(): AI_COMPLETE (claude-haiku-4-5) with a JSON schema on
 --           every page file, as INSERT … SELECT FROM pdf_page — the pages run
 --           in parallel. If that statement fails, the pages are retried one by
@@ -458,35 +463,116 @@ UNION ALL SELECT created_at,   actor,       'enrich_' || status, 'document_enric
 --   page_ocr is the sink: the Cortex Search service indexes its index_text.
 --   One failing file never blocks the others: it gets 'failed' rows with the
 --   error message. Only INSERTs: append-only.
+--
+-- Column-level lineage. Every row the pipeline writes comes from an
+-- INSERT … SELECT whose data columns are computed from columns of its source
+-- tables, so Snowflake can trace each column back to its origin:
+--
+--   ai_request ─┬─► ai_job_log (request_id, file_id, document_id)
+--               └─► pdf_conversion.run_id ─► pdf_page.run_id ─► page_ocr.run_id
+--   stored_file.stage_path, checksum
+--               ─► pdf_conversion (converter, pdf_path, page_count)
+--               ─► pdf_page (page_no, stage_path)
+--               ─► page_ocr (ocr_text, headings_list, image_short_summaries_list,
+--                            table_summaries_list, page_short_summary, index_text)
+--               ─► document_text.content, pages
+--               ─► document_enrichment (summary, suggested_type_id, suggested_tag_ids,
+--                                       extracted_metadata)  + the definition views
+--   page_ocr.index_text ─► Cortex Search service document_search
+--
+-- Procedure variables appear only in WHERE clauses (which request, which
+-- file, which page) and as error messages — never as data values. Model names,
+-- ids (UUID_STRING()) and timestamps (SYSDATE()) are generated, not derived.
+-- The one step outside SQL is writing the PDF files to the stage; the tables
+-- see it through the stage paths, which are themselves derived columns.
 
 CREATE STREAM IF NOT EXISTS ai_request_stream
     ON TABLE ai_request
     APPEND_ONLY = TRUE
     COMMENT = 'New AI requests, consumed by process_ai()';
 
--- Converts one file to PDF and writes one single-page PDF per page to
--- @doc_files/{checksum}/derived/. PDF passes through; images become one page
--- per frame; plain text is typeset. Other types are 'skipped'. Records the
--- result in pdf_conversion and the pages in pdf_page. Keep the extension
--- lists in sync with core/files.py.
-CREATE OR REPLACE PROCEDURE convert_to_pdf_pages(run_id VARCHAR, file_id VARCHAR)
+-- How a stored file becomes a PDF, from its extension; NULL = not supported
+-- (the file is 'skipped'). Keep the extension lists in sync with core/files.py.
+CREATE OR REPLACE FUNCTION pdf_converter(stage_path VARCHAR)
+    RETURNS VARCHAR
+    COMMENT = 'pdf | image | text, or NULL when the file type is not converted'
+AS
+$$
+    CASE
+        WHEN REGEXP_LIKE(LOWER(stage_path), '.*[.](pdf)$') THEN 'pdf'
+        WHEN REGEXP_LIKE(LOWER(stage_path), '.*[.](jpg|jpeg|png|gif|webp|bmp|tif|tiff)$') THEN 'image'
+        WHEN REGEXP_LIKE(LOWER(stage_path), '.*[.](txt|md|csv|json|xml)$') THEN 'text'
+    END
+$$;
+
+-- The stored file as PDF: the file itself, or its converted copy.
+CREATE OR REPLACE FUNCTION pdf_path(stage_path VARCHAR, checksum VARCHAR)
+    RETURNS VARCHAR
+    COMMENT = 'Stage path of the stored file as PDF'
+AS
+$$
+    CASE
+        WHEN pdf_converter(stage_path) = 'pdf' THEN stage_path
+        WHEN pdf_converter(stage_path) IS NOT NULL
+            THEN '@doc_files/' || checksum || '/derived/converted.pdf'
+    END
+$$;
+
+-- Where the single-page PDF of a page lives. Content-addressed: identical
+-- uploads share their pages.
+CREATE OR REPLACE FUNCTION pdf_page_path(checksum VARCHAR, page_no NUMBER)
+    RETURNS VARCHAR
+    COMMENT = 'Stage path of one single-page PDF'
+AS
+$$
+    '@doc_files/' || checksum || '/derived/page-' || LPAD(page_no::VARCHAR, 4, '0') || '.pdf'
+$$;
+
+-- Number of pages of a staged PDF.
+CREATE OR REPLACE FUNCTION pdf_page_count(pdf_path VARCHAR)
+    RETURNS NUMBER
+    LANGUAGE PYTHON
+    RUNTIME_VERSION = '3.11'
+    PACKAGES = ('snowflake-snowpark-python', 'pypdf')
+    HANDLER = 'count'
+    COMMENT = 'Number of pages of a staged PDF; NULL for NULL'
+AS
+$$
+import io
+
+from pypdf import PdfReader
+from snowflake.snowpark.files import SnowflakeFile
+
+
+def count(pdf_path):
+    if pdf_path is None:
+        return None
+    with SnowflakeFile.open(pdf_path, "rb", require_scoped_url=False) as fh:
+        reader = PdfReader(io.BytesIO(fh.read()))
+    if reader.is_encrypted:
+        reader.decrypt("")
+    return len(reader.pages)
+$$;
+
+-- Writes the stored file as PDF and one single-page PDF per page to the stage,
+-- at the paths given by pdf_path() and pdf_page_path(). PDF passes through;
+-- images become one page per frame; plain text is typeset. Writes files only,
+-- no table rows (process_ai() records them with INSERT … SELECT, for lineage).
+-- Returns NULL on success (or when the type is not converted), else the error.
+CREATE OR REPLACE PROCEDURE convert_to_pdf_pages(file_id VARCHAR)
     RETURNS VARCHAR
     LANGUAGE PYTHON
     RUNTIME_VERSION = '3.11'
     PACKAGES = ('snowflake-snowpark-python', 'pypdf', 'pillow', 'reportlab')
     HANDLER = 'run'
-    COMMENT = 'Converts a stored file to PDF and splits it into single-page PDFs.'
+    COMMENT = 'Writes a stored file as PDF and as single-page PDFs to @doc_files.'
     EXECUTE AS OWNER
 AS
 $$
 import io
-import os
 
 from snowflake.snowpark.files import SnowflakeFile
 
-PDF_EXTENSIONS = {".pdf"}
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
-TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".json", ".xml"}
 
 
 def image_to_pdf(data):
@@ -516,34 +602,21 @@ def text_to_pdf(data):
     return out.getvalue()
 
 
-def run(session, run_id, file_id):
-    def record(status, converter=None, pdf_path=None, pages=None, error=None):
-        session.sql(
-            "INSERT INTO pdf_conversion (event_id, created_at, run_id, file_id, status, "
-            "converter, pdf_path, page_count, error) "
-            "SELECT UUID_STRING(), SYSDATE(), ?, ?, ?, ?, ?, ?, ?",
-            params=[run_id, file_id, status, converter, pdf_path, pages, error]).collect()
-        return status
 
-    rows = session.sql("SELECT stage_path, checksum FROM stored_file WHERE file_id = ? LIMIT 1",
-                       params=[file_id]).collect()
+
+def run(session, file_id):
+    rows = session.sql(
+        "SELECT stage_path, checksum, pdf_converter(stage_path), pdf_path(stage_path, checksum) "
+        "FROM stored_file WHERE file_id = ? LIMIT 1", params=[file_id]).collect()
     if not rows:
-        return record("failed", error="unknown file")
-    stage_path, checksum = rows[0][0], rows[0][1]
-    ext = os.path.splitext(stage_path)[1].lower()
+        return "unknown file"
+    stage_path, checksum, converter, pdf_path = rows[0]
+    if converter is None:
+        return None                       # recorded as 'skipped' by process_ai()
     try:
         with SnowflakeFile.open(stage_path, "rb", require_scoped_url=False) as fh:
             data = fh.read()
-        folder = f"@doc_files/{checksum}/derived"
-        if ext in PDF_EXTENSIONS or data[:5] == b"%PDF-":
-            converter, pdf, pdf_path = "pdf", data, stage_path
-        elif ext in IMAGE_EXTENSIONS:
-            converter, pdf, pdf_path = "image", image_to_pdf(data), f"{folder}/converted.pdf"
-        elif ext in TEXT_EXTENSIONS:
-            converter, pdf, pdf_path = "text", text_to_pdf(data), f"{folder}/converted.pdf"
-        else:
-            return record("skipped", error=f"no PDF conversion for {ext or 'this file type'}")
-
+        pdf = {"image": image_to_pdf, "text": text_to_pdf}.get(converter, bytes)(data)
         from pypdf import PdfReader, PdfWriter
         reader = PdfReader(io.BytesIO(pdf))
         if reader.is_encrypted:
@@ -551,31 +624,25 @@ def run(session, run_id, file_id):
         if pdf_path != stage_path:
             session.file.put_stream(io.BytesIO(pdf), pdf_path, auto_compress=False,
                                     overwrite=True)
-        pages = []
-        for n, page in enumerate(reader.pages, start=1):
+        paths = [r[0] for r in session.sql(
+            "SELECT pdf_page_path(?, g.value::NUMBER) "
+            "FROM TABLE(FLATTEN(input => ARRAY_GENERATE_RANGE(1, ? + 1))) g ORDER BY g.index",
+            params=[checksum, len(reader.pages)]).collect()]
+        for page, path in zip(reader.pages, paths):
             writer = PdfWriter()
             writer.add_page(page)
             buf = io.BytesIO()
             writer.write(buf)
-            path = f"{folder}/page-{n:04d}.pdf"
             buf.seek(0)
             session.file.put_stream(buf, path, auto_compress=False, overwrite=True)
-            pages.append((run_id, file_id, n, path))
-        if not pages:
-            return record("skipped", converter, pdf_path, 0, "the PDF has no pages")
-        session.create_dataframe(pages, schema=["run_id", "file_id", "page_no", "stage_path"]) \
-            .select_expr("UUID_STRING() AS event_id", "SYSDATE() AS created_at",
-                         "run_id", "file_id", "page_no", "stage_path") \
-            .write.mode("append").save_as_table("pdf_page", column_order="name")
-        return record("done", converter, pdf_path, len(pages))
+        return None
     except Exception as exc:
-        return record("failed", error=str(exc)[:2000])
+        return str(exc)[:2000] or type(exc).__name__
 $$;
 
 -- Structured OCR of the pages p_from..p_to of one run: one AI_COMPLETE call
 -- per page file, all in one INSERT … SELECT FROM pdf_page (lineage).
-CREATE OR REPLACE PROCEDURE ocr_pages(p_run VARCHAR, p_file VARCHAR, p_doc VARCHAR,
-                                      p_from NUMBER, p_to NUMBER)
+CREATE OR REPLACE PROCEDURE ocr_pages(p_run VARCHAR, p_file VARCHAR, p_from NUMBER, p_to NUMBER)
     RETURNS NUMBER
     LANGUAGE SQL
     COMMENT = 'Structured OCR (AI_COMPLETE, claude-haiku-4-5) of single-page PDFs.'
@@ -586,7 +653,7 @@ BEGIN
     INSERT INTO page_ocr (event_id, created_at, run_id, file_id, document_id, filename, page_no,
                           model, status, ocr_text, headings_list, image_short_summaries_list,
                           table_summaries_list, page_short_summary, index_text, error)
-    SELECT UUID_STRING(), SYSDATE(), y.run_id, y.file_id, :p_doc, y.filename, y.page_no,
+    SELECT UUID_STRING(), SYSDATE(), y.run_id, y.file_id, y.document_id, y.filename, y.page_no,
            'claude-haiku-4-5', IFF(y.ocr_text IS NULL, 'failed', 'done'),
            y.ocr_text, y.headings, y.images, y.tables, y.page_summary,
            -- What Cortex Search indexes: every field except ocr_text.
@@ -597,14 +664,14 @@ BEGIN
                NULLIF(ARRAY_TO_STRING(y.tables, '\n'), '')), '\n'), ''),
            IFF(y.ocr_text IS NULL, 'No valid structured output', NULL)
     FROM (
-        SELECT x.run_id, x.file_id, x.filename, x.page_no,
+        SELECT x.run_id, x.file_id, x.document_id, x.filename, x.page_no,
                x.j:ocr_text::VARCHAR                   AS ocr_text,
                x.j:headings_list::ARRAY                AS headings,
                x.j:image_short_summaries_list::ARRAY   AS images,
                x.j:table_summaries_list::ARRAY         AS tables,
                x.j:page_short_summary::VARCHAR         AS page_summary
         FROM (
-            SELECT p.run_id, p.file_id, f.filename, p.page_no,
+            SELECT p.run_id, p.file_id, r.document_id, f.filename, p.page_no,
                    TRY_PARSE_JSON(TO_VARCHAR(AI_COMPLETE(
                        model => 'claude-haiku-4-5',
                        prompt => 'This file is one page of a document. Transcribe it (OCR) and '
@@ -644,6 +711,7 @@ BEGIN
                        }))) AS j
             FROM pdf_page p
             JOIN stored_file f ON f.file_id = p.file_id
+            JOIN ai_request r ON r.event_id = p.run_id
             WHERE p.run_id = :p_run AND p.file_id = :p_file
               AND p.page_no BETWEEN :p_from AND :p_to
         ) x
@@ -664,16 +732,16 @@ DECLARE
     v_failed  INTEGER DEFAULT 0;
     v_req     VARCHAR;
     v_fid     VARCHAR;
-    v_doc     VARCHAR;
     v_chk     VARCHAR;
     v_reason  VARCHAR;
     v_status  VARCHAR;
+    v_err     VARCHAR;
     v_page    INTEGER;
     v_n       INTEGER;
     v_msg     VARCHAR;
     pages     RESULTSET;
     queued CURSOR FOR
-        SELECT q.request_id, q.file_id, q.document_id, f.checksum, r.reason
+        SELECT q.request_id, q.file_id, f.checksum, r.reason
         FROM ai_job_log q
         JOIN stored_file f ON f.file_id = q.file_id
         LEFT JOIN ai_request r ON r.event_id = q.request_id
@@ -689,7 +757,6 @@ BEGIN
     FOR r IN queued DO
         v_req := r.request_id;
         v_fid := r.file_id;
-        v_doc := r.document_id;
         v_chk := r.checksum;
         v_reason := r.reason;
 
@@ -703,13 +770,13 @@ BEGIN
                                       page_no, model, status, ocr_text, headings_list,
                                       image_short_summaries_list, table_summaries_list,
                                       page_short_summary, index_text, error)
-                SELECT UUID_STRING(), SYSDATE(), :v_req, :v_fid, :v_doc, f.filename, o.page_no,
-                       o.model, o.status, o.ocr_text, o.headings_list,
+                SELECT UUID_STRING(), SYSDATE(), r.event_id, r.file_id, r.document_id, f.filename,
+                       o.page_no, o.model, o.status, o.ocr_text, o.headings_list,
                        o.image_short_summaries_list, o.table_summaries_list,
                        o.page_short_summary, o.index_text, o.error
-                FROM page_ocr o
-                JOIN stored_file f ON f.file_id = :v_fid
-                WHERE o.run_id = (
+                FROM ai_request r
+                JOIN stored_file f ON f.file_id = r.file_id
+                JOIN page_ocr o ON o.run_id = (
                     SELECT o2.run_id
                     FROM page_ocr o2
                     JOIN stored_file t ON t.file_id = o2.file_id
@@ -717,16 +784,54 @@ BEGIN
                     GROUP BY o2.run_id
                     HAVING COUNT_IF(o2.status <> 'done') = 0
                     ORDER BY MAX(o2.created_at) DESC
-                    LIMIT 1);
+                    LIMIT 1)
+                WHERE r.event_id = :v_req;
                 v_n := SQLROWCOUNT;
             END IF;
             IF (v_n = 0) THEN
-                CALL convert_to_pdf_pages(:v_req, :v_fid);
+                -- Write the PDF files (no rows), then record them from the sources.
+                CALL convert_to_pdf_pages(:v_fid);
+                v_err := (SELECT $1 FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())));
+                IF (v_err IS NULL) THEN
+                    INSERT INTO pdf_conversion (event_id, created_at, run_id, file_id, status,
+                                                converter, pdf_path, page_count, error)
+                    SELECT UUID_STRING(), SYSDATE(), c.run_id, c.file_id,
+                           CASE WHEN c.converter IS NULL THEN 'skipped'
+                                WHEN c.page_count > 0 THEN 'done'
+                                ELSE 'skipped' END,
+                           c.converter, c.pdf_path, c.page_count,
+                           CASE WHEN c.converter IS NULL THEN 'no PDF conversion for this file type'
+                                WHEN COALESCE(c.page_count, 0) = 0 THEN 'the PDF has no pages' END
+                    FROM (
+                        SELECT r.event_id AS run_id, f.file_id,
+                               pdf_converter(f.stage_path)                      AS converter,
+                               pdf_path(f.stage_path, f.checksum)               AS pdf_path,
+                               pdf_page_count(pdf_path(f.stage_path, f.checksum)) AS page_count
+                        FROM ai_request r
+                        JOIN stored_file f ON f.file_id = r.file_id
+                        WHERE r.event_id = :v_req
+                    ) c;
+                    INSERT INTO pdf_page (event_id, created_at, run_id, file_id, page_no, stage_path)
+                    SELECT UUID_STRING(), SYSDATE(), c.run_id, c.file_id, g.value::NUMBER,
+                           pdf_page_path(f.checksum, g.value::NUMBER)
+                    FROM pdf_conversion c
+                    JOIN stored_file f ON f.file_id = c.file_id,
+                         LATERAL FLATTEN(input => ARRAY_GENERATE_RANGE(1, c.page_count + 1)) g
+                    WHERE c.run_id = :v_req AND c.file_id = :v_fid AND c.status = 'done';
+                ELSE
+                    INSERT INTO pdf_conversion (event_id, created_at, run_id, file_id, status,
+                                                converter, pdf_path, error)
+                    SELECT UUID_STRING(), SYSDATE(), r.event_id, f.file_id, 'failed',
+                           pdf_converter(f.stage_path), pdf_path(f.stage_path, f.checksum), :v_err
+                    FROM ai_request r
+                    JOIN stored_file f ON f.file_id = r.file_id
+                    WHERE r.event_id = :v_req;
+                END IF;
                 v_status := (SELECT MAX(status) FROM pdf_conversion
                              WHERE run_id = :v_req AND file_id = :v_fid);
                 IF (v_status = 'done') THEN
                     BEGIN
-                        CALL ocr_pages(:v_req, :v_fid, :v_doc, 1, 1000000);
+                        CALL ocr_pages(:v_req, :v_fid, 1, 1000000);
                     EXCEPTION
                         WHEN OTHER THEN
                             -- Page by page, so one bad page does not fail the rest.
@@ -737,17 +842,21 @@ BEGIN
                             FOR p IN c DO
                                 v_page := p.page_no;
                                 BEGIN
-                                    CALL ocr_pages(:v_req, :v_fid, :v_doc, :v_page, :v_page);
+                                    CALL ocr_pages(:v_req, :v_fid, :v_page, :v_page);
                                 EXCEPTION
                                     WHEN OTHER THEN
                                         v_msg := SQLERRM;
                                         INSERT INTO page_ocr (event_id, created_at, run_id, file_id,
                                                               document_id, filename, page_no, model,
                                                               status, error)
-                                        SELECT UUID_STRING(), SYSDATE(), :v_req, :v_fid, :v_doc,
-                                               f.filename, :v_page, 'claude-haiku-4-5', 'failed',
-                                               :v_msg
-                                        FROM stored_file f WHERE f.file_id = :v_fid;
+                                        SELECT UUID_STRING(), SYSDATE(), p.run_id, p.file_id,
+                                               r.document_id, f.filename, p.page_no,
+                                               'claude-haiku-4-5', 'failed', :v_msg
+                                        FROM pdf_page p
+                                        JOIN stored_file f ON f.file_id = p.file_id
+                                        JOIN ai_request r ON r.event_id = p.run_id
+                                        WHERE p.run_id = :v_req AND p.file_id = :v_fid
+                                          AND p.page_no = :v_page;
                                 END;
                             END FOR;
                     END;
@@ -757,24 +866,24 @@ BEGIN
             -- 2b. Text: the pages in order, or why there are none.
             INSERT INTO document_text (event_id, extracted_at, actor, file_id, model, status,
                                        pages, content, error)
-            SELECT UUID_STRING(), SYSDATE(), 'system:ai', :v_fid, MAX(o.model),
+            SELECT UUID_STRING(), SYSDATE(), 'system:ai', o.file_id, MAX(o.model),
                    IFF(COUNT_IF(o.status <> 'done') > 0, 'failed', 'done'),
-                   COUNT(*),
+                   COUNT(o.page_no),
                    LISTAGG('--- Page ' || o.page_no || ' ---\n' || COALESCE(o.ocr_text, ''), '\n\n')
                        WITHIN GROUP (ORDER BY o.page_no),
                    IFF(COUNT_IF(o.status <> 'done') > 0,
-                       COUNT_IF(o.status <> 'done') || ' of ' || COUNT(*) || ' pages failed: '
-                       || ANY_VALUE(o.error), NULL)
+                       COUNT_IF(o.status <> 'done') || ' of ' || COUNT(o.page_no)
+                       || ' pages failed: ' || ANY_VALUE(o.error), NULL)
             FROM page_ocr o
             WHERE o.run_id = :v_req AND o.file_id = :v_fid
-            HAVING COUNT(*) > 0;
+            GROUP BY o.file_id;
             v_n := SQLROWCOUNT;
             IF (v_n = 0) THEN
                 INSERT INTO document_text (event_id, extracted_at, actor, file_id, model, status,
                                            pages, error)
-                SELECT UUID_STRING(), SYSDATE(), 'system:ai', :v_fid, NULL,
-                       COALESCE(MAX(c.status), 'failed'), 0,
-                       COALESCE(MAX(c.error), 'no pages')
+                SELECT UUID_STRING(), SYSDATE(), 'system:ai', c.file_id, NULL,
+                       IFF(c.status = 'failed', 'failed', 'skipped'), COALESCE(c.page_count, 0),
+                       COALESCE(c.error, 'no pages')
                 FROM pdf_conversion c
                 WHERE c.run_id = :v_req AND c.file_id = :v_fid;
             END IF;
@@ -782,7 +891,9 @@ BEGIN
             WHEN OTHER THEN
                 v_msg := SQLERRM;
                 INSERT INTO document_text (event_id, extracted_at, actor, file_id, model, status, error)
-                SELECT UUID_STRING(), SYSDATE(), 'system:ai', :v_fid, 'claude-haiku-4-5', 'failed', :v_msg;
+                SELECT UUID_STRING(), SYSDATE(), 'system:ai', r.file_id, 'claude-haiku-4-5',
+                       'failed', :v_msg
+                FROM ai_request r WHERE r.event_id = :v_req;
         END;
 
         -- 2c. Enrichment: summary, type + tag suggestions, metadata extraction.
@@ -790,13 +901,13 @@ BEGIN
             INSERT INTO document_enrichment (event_id, created_at, actor, file_id, document_id, model,
                                              status, summary, suggested_type_id, suggested_tag_ids,
                                              extracted_metadata)
-            SELECT UUID_STRING(), SYSDATE(), 'system:ai', x.file_id, :v_doc, 'claude-sonnet-4-5', 'done',
+            SELECT UUID_STRING(), SYSDATE(), 'system:ai', x.file_id, x.document_id, 'claude-sonnet-4-5', 'done',
                    x.j:summary::VARCHAR,
                    NULLIF(x.j:document_type_id::VARCHAR, ''),
                    x.j:tag_ids::ARRAY,
                    x.j:metadata::ARRAY
             FROM (
-                SELECT t.file_id,
+                SELECT t.file_id, r.document_id,
                        TRY_PARSE_JSON(TO_VARCHAR(AI_COMPLETE(
                            model => 'claude-sonnet-4-5',
                            prompt => 'You are filing a document in a document management system. '
@@ -838,14 +949,16 @@ BEGIN
                                }
                            }))) AS j
                 FROM document_text_current t
-                WHERE t.file_id = :v_fid AND LENGTH(t.content) > 0
+                JOIN ai_request r ON r.file_id = t.file_id
+                WHERE r.event_id = :v_req AND LENGTH(t.content) > 0
             ) x;
             v_n := SQLROWCOUNT;
             IF (v_n = 0) THEN
                 INSERT INTO document_enrichment (event_id, created_at, actor, file_id, document_id,
                                                  model, status, error)
-                SELECT UUID_STRING(), SYSDATE(), 'system:ai', :v_fid, :v_doc, NULL, 'skipped',
-                       'No text to enrich';
+                SELECT UUID_STRING(), SYSDATE(), 'system:ai', r.file_id, r.document_id, NULL, 'skipped',
+                       'No text to enrich'
+                FROM ai_request r WHERE r.event_id = :v_req;
             END IF;
             v_done := v_done + 1;
         EXCEPTION
@@ -853,14 +966,16 @@ BEGIN
                 v_msg := SQLERRM;
                 INSERT INTO document_enrichment (event_id, created_at, actor, file_id, document_id,
                                                  model, status, error)
-                SELECT UUID_STRING(), SYSDATE(), 'system:ai', :v_fid, :v_doc, 'claude-sonnet-4-5',
-                       'failed', :v_msg;
+                SELECT UUID_STRING(), SYSDATE(), 'system:ai', r.file_id, r.document_id,
+                       'claude-sonnet-4-5', 'failed', :v_msg
+                FROM ai_request r WHERE r.event_id = :v_req;
                 v_failed := v_failed + 1;
         END;
 
         -- 2d. Done.
         INSERT INTO ai_job_log (event_id, event_ts, request_id, file_id, document_id, step, message)
-        SELECT UUID_STRING(), SYSDATE(), :v_req, :v_fid, :v_doc, 'finished', :v_msg;
+        SELECT UUID_STRING(), SYSDATE(), r.event_id, r.file_id, r.document_id, 'finished', :v_msg
+        FROM ai_request r WHERE r.event_id = :v_req;
         v_msg := NULL;
     END FOR;
     RETURN v_done || ' processed, ' || v_failed || ' failed';

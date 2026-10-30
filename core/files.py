@@ -29,8 +29,8 @@ from core.session import cache_data
 
 STAGE = "@doc_files"
 
-# Formats convert_to_pdf_pages() turns into PDF pages; others are marked
-# 'skipped' by the task. Keep in sync with the lists in that procedure.
+# Formats the pipeline turns into PDF pages; others are marked 'skipped'.
+# Keep in sync with pdf_converter() in sql/minidms-setup.sql.
 PDF_EXTENSIONS = {".pdf"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
 TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".json", ".xml"}

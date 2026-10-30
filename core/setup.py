@@ -20,7 +20,7 @@ SETUP_SQL = Path(__file__).resolve().parents[1] / "sql" / "minidms-setup.sql"
 _IDENT = re.compile(r'^(?:[A-Za-z_][A-Za-z0-9_$]*|"[^"]+")$')
 _CREATE = re.compile(
     r"^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(ADAPTIVE\s+WAREHOUSE|HYBRID\s+TABLE|CORTEX\s+SEARCH\s+SERVICE|"
-    r"STAGE|TABLE|VIEW|STREAM|PROCEDURE|TASK)\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_][\w$]*)",
+    r"STAGE|TABLE|VIEW|STREAM|FUNCTION|PROCEDURE|TASK)\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_][\w$]*)",
     re.IGNORECASE,
 )
 _KIND = {"adaptive warehouse": "warehouse", "hybrid table": "hybrid",
@@ -31,6 +31,7 @@ WAREHOUSES = ("minidms_wh",)
 STAGES = ("doc_files",)
 VIEWS = SCHEMA_VIEWS
 STREAMS = ("ai_request_stream",)
+FUNCTIONS = ("pdf_converter", "pdf_path", "pdf_page_path", "pdf_page_count")
 PROCEDURES = ("convert_to_pdf_pages", "ocr_pages", "process_ai")
 TASKS = ("process_ai_task",)
 SEARCH_SERVICES = ("document_search",)
@@ -40,7 +41,7 @@ SEARCH_SERVICES = ("document_search",)
 class Statement:
     sql: str
     kind: str | None = None      # warehouse | stage | hybrid | table | view | stream
-                                 # | procedure | task | resume (ALTER TASK … RESUME)
+                                 # | function | procedure | task | resume (ALTER TASK … RESUME)
                                  # | search (Cortex Search service) | None
     name: str | None = None      # object name, lower case
 
@@ -234,10 +235,11 @@ def steps(text: str | None = None) -> list[Step]:
              "split into pages (Python procedure), every page gets a structured OCR with "
              "AI_COMPLETE (claude-haiku-4-5) into `page_ocr`, then AI_COMPLETE "
              "(claude-sonnet-4-5) writes the summary, type and tag suggestions and metadata. "
-             "The owning role needs CREATE STREAM/TASK/PROCEDURE, EXECUTE TASK, USAGE on the "
+             "The owning role needs CREATE STREAM/TASK/FUNCTION/PROCEDURE, EXECUTE TASK, USAGE on the "
              "warehouse, SNOWFLAKE.CORTEX_USER and the Anaconda terms accepted. The last "
-             "statement resumes the task.",
-             by_kind("stream", "procedure", "task", "resume")),
+             "statement resumes the task. Every row is written by INSERT … SELECT from its "
+             "sources, so Snowflake records column-level lineage.",
+             by_kind("stream", "function", "procedure", "task", "resume")),
         Step("search", "Cortex Search (the sink of the pipeline)",
              "The service `document_search` indexes one search document per page from "
              "`page_ocr` (summary, headings, image and table summaries — not the raw OCR text) "
@@ -289,6 +291,9 @@ def existing_objects(session=None) -> dict[str, set[str]]:
     procedures = db.query(
         "SELECT LOWER(procedure_name) FROM information_schema.procedures "
         "WHERE procedure_schema = CURRENT_SCHEMA()", session=session)
+    functions = db.query(
+        "SELECT LOWER(function_name) FROM information_schema.functions "
+        "WHERE function_schema = CURRENT_SCHEMA()", session=session)
     table_names = {r[0] for r in tables if r[1] in ("BASE TABLE", "HYBRID TABLE")}
     hybrid = _show(session, "HYBRID TABLES IN SCHEMA")
     tasks = _show(session, "TASKS IN SCHEMA") or {}
@@ -299,6 +304,7 @@ def existing_objects(session=None) -> dict[str, set[str]]:
         "table": table_names,
         "view": {r[0] for r in tables if r[1] == "VIEW"},
         "stage": {r[0] for r in stages},
+        "function": {r[0] for r in functions},
         "procedure": {r[0] for r in procedures},
         "stream": set(_show(session, "STREAMS IN SCHEMA") or {}),
         "task": set(tasks),
@@ -314,6 +320,7 @@ NEEDED = {
     "table": STANDARD_TABLES,
     "view": VIEWS,
     "stream": STREAMS,
+    "function": FUNCTIONS,
     "procedure": PROCEDURES,
     "task": TASKS,
     "resume": TASKS,

@@ -245,6 +245,8 @@ class FakeSession:
                            + [(v, "VIEW") for v in schema.VIEWS])
         if "INFORMATION_SCHEMA.STAGES" in up:
             return _Result([] if self.schema_missing else [("doc_files",)])
+        if "INFORMATION_SCHEMA.FUNCTIONS" in up:
+            return _Result([] if self.schema_missing else [(f,) for f in setup.FUNCTIONS])
         if "INFORMATION_SCHEMA.PROCEDURES" in up:
             return _Result([] if self.schema_missing else [(p,) for p in setup.PROCEDURES])
         if "TASK_HISTORY" in up:

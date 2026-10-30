@@ -42,8 +42,11 @@ Schema: [`sql/minidms-setup.sql`](sql/minidms-setup.sql)
    `ai_request`; a stream on it fires a triggered task, which calls `process_ai()`:
    1. **Convert and split** — the Python procedure `convert_to_pdf_pages()` converts the
       file to PDF (PDF passes through; images become one page per frame; plain text is
-      typeset) and writes one single-page PDF per page to `@doc_files/{sha256}/derived/`
-      (`pdf_conversion`, `pdf_page`). Other file types are `skipped`.
+      typeset) and writes one single-page PDF per page to `@doc_files/{sha256}/derived/`.
+      It writes files only; the rows in `pdf_conversion` and `pdf_page` are then recorded
+      with `INSERT … SELECT FROM stored_file`, using the SQL functions `pdf_converter()`,
+      `pdf_path()`, `pdf_page_path()` and the Python UDF `pdf_page_count()`. Other file
+      types are `skipped`.
    2. **Page OCR** — `ocr_pages()` calls `AI_COMPLETE` (`claude-haiku-4-5`) with a JSON
       schema on every page, in parallel, into `page_ocr`: `ocr_text` (images described at
       length inline as `[Image: …]`), `headings_list`, `image_short_summaries_list`,
@@ -54,6 +57,15 @@ Schema: [`sql/minidms-setup.sql`](sql/minidms-setup.sql)
       tag suggestions and metadata to `document_enrichment`.
 
    The app never calls Cortex itself.
+
+   **Column-level lineage:** every row the pipeline writes comes from an
+   `INSERT … SELECT` whose data columns are computed from columns of its source tables.
+   Procedure variables appear only in `WHERE` clauses (which request, file or page) and as
+   error messages, never as values; a test enforces this. The chain is
+   `ai_request` / `stored_file` → `pdf_conversion` → `pdf_page` → `page_ocr` →
+   `document_text` → `document_enrichment`, and `page_ocr.index_text` → Cortex Search.
+   Writing the PDF files is the one step outside SQL; the tables see it through the stage
+   paths, which are themselves derived columns.
 6. **Cortex Search is the sink and the search engine.** The service `document_search`
    indexes **one search document per page**: the `index_text` of the latest successful run
    per file in `page_ocr` (multilingual embedding model, target lag 1 minute). The Search
@@ -143,7 +155,7 @@ links to it. It walks through:
 12. **Starter definitions** (optional) — a few document types, metadata types and tags
 
 Every statement is shown before it runs; each has its own *Run* button, and every step
-has *Run all*. A progress bar shows how many of the 36 objects exist (including whether
+has *Run all*. A progress bar shows how many of the 40 objects exist (including whether
 the task is started); a log shows each result.
 
 Who may run the setup statements: on a local run, you; with credentials you entered
@@ -350,9 +362,10 @@ These could not be verified without a Snowflake account. Please check them once:
    `PRIMARY KEY (…, version)` plus `UNIQUE (event_id)`; a duplicate raises an error that
    mentions the duplicate key (the app turns it into a conflict or "already applied").
 3. **Conversion:** the Anaconda terms are accepted and `pypdf`, `pillow` and `reportlab`
-   are available to Python procedures; `SnowflakeFile.open('@doc_files/…', 'rb',
-   require_scoped_url=False)` reads the upload and `session.file.put_stream` writes the
-   page PDFs from inside the procedure. Upload a PDF, a PNG and a TXT and check
+   are available to Python procedures and UDFs; `SnowflakeFile.open('@doc_files/…', 'rb',
+   require_scoped_url=False)` reads staged files in both, `session.file.put_stream` writes
+   the page PDFs from inside the procedure, and `CALL …` followed by
+   `RESULT_SCAN(LAST_QUERY_ID())` returns its result inside `process_ai()`. Upload a PDF, a PNG and a TXT and check
    `SELECT * FROM pdf_conversion;` and `LIST @doc_files PATTERN = '.*/derived/.*';`.
 4. **Page OCR:** `claude-haiku-4-5` is available to `AI_COMPLETE` in your region, and the
    call form `AI_COMPLETE(model => …, prompt => …, file => TO_FILE(…), model_parameters =>
@@ -368,7 +381,9 @@ These could not be verified without a Snowflake account. Please check them once:
 6. **Column-level lineage** appears for the `page_ocr` columns, `document_text.content` and
    the `document_enrichment` columns (Snowsight lineage or
    `SNOWFLAKE.ACCOUNT_USAGE.ACCESS_HISTORY`, Enterprise edition or higher). The Python
-   conversion step itself is not traced column by column; lineage starts at
-   `pdf_page.stage_path`.
+   conversion step writes files, not columns: `pdf_page.stage_path` is derived from
+   `stored_file.checksum`, and `pdf_conversion.page_count` from `stored_file.stage_path`
+   through the UDF `pdf_page_count()` — check that lineage passes through the Python UDF
+   and through `LATERAL FLATTEN` (for `pdf_page.page_no`).
 7. `@st.cache_data` is shared across viewers on the compute pool (check `QUERY_HISTORY`
    after opening the app as two users).

@@ -69,15 +69,15 @@ def test_same_content_same_name_is_stored_once(fake):
     assert len([k for k in fake.stage if k.startswith("doc_files/")]) == 1
 
 
-def test_ai_extensions_match_the_procedure():
-    """The app's lists and the ones in convert_to_pdf_pages() must agree."""
-    import ast
+def test_ai_extensions_match_the_converter_function():
+    """The app's lists and the ones in pdf_converter() must agree."""
     import re
 
     from core import setup
 
-    proc = {s.name: s.sql for s in setup.setup_statements() if s.kind == "procedure"}
-    code = proc["convert_to_pdf_pages"]
-    for name in ("PDF_EXTENSIONS", "IMAGE_EXTENSIONS", "TEXT_EXTENSIONS"):
-        literal = re.search(rf"^{name} = (\{{.*\}})$", code, re.M).group(1)
-        assert ast.literal_eval(literal) == getattr(files, name), name
+    fn = {s.name: s.sql for s in setup.setup_statements() if s.kind == "function"}
+    code = fn["pdf_converter"]
+    for kind, name in (("pdf", "PDF_EXTENSIONS"), ("image", "IMAGE_EXTENSIONS"),
+                       ("text", "TEXT_EXTENSIONS")):
+        exts = re.search(rf"\[\.\]\(([a-z|]+)\)\$'\) THEN '{kind}'", code).group(1)
+        assert {f".{e}" for e in exts.split("|")} == getattr(files, name), name
