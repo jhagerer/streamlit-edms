@@ -163,11 +163,16 @@ def test_search_uses_text_and_summary(fake):
     assert at.dataframe[0].value["label"].tolist() == ["Invoice 42"]
 
 
-def test_warehouse_gate_blocks_non_adaptive(fake):
+def test_any_warehouse_works_but_one_is_needed(fake, monkeypatch):
     fake.warehouse_type = "STANDARD"
     at = app().run()
     assert not at.exception, at.exception
-    assert any("not adaptive" in e.value for e in at.error)
+    assert at.title[0].value == "Documents"                 # a standard warehouse is fine
+
+    from core import read
+    monkeypatch.setattr(read, "warehouse_type", lambda session=None: (None, None))
+    at = app().run()
+    assert any("No warehouse is in use" in e.value for e in at.error)
     assert not at.title                                     # the page did not render
     at.switch_page("app_pages/setup.py").run()              # setup still works
     assert at.title[0].value == "Setup"

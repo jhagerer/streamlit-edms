@@ -8,7 +8,7 @@
 -- ── Owner of the schema objects (creates them by running minidms-setup.sql) ──
 -- The AI task and procedure run with this role's rights (EXECUTE AS OWNER),
 -- so Cortex and task privileges belong here.
-GRANT CREATE WAREHOUSE ON ACCOUNT TO ROLE <schema_owner_role>;           -- minidms_wh (adaptive)
+GRANT CREATE WAREHOUSE ON ACCOUNT TO ROLE <schema_owner_role>;           -- minidms_wh, if it does not exist yet
 GRANT USAGE ON DATABASE <db> TO ROLE <schema_owner_role>;
 GRANT USAGE, CREATE TABLE, CREATE HYBRID TABLE, CREATE VIEW, CREATE STAGE, CREATE STREAM,
       CREATE TASK, CREATE PROCEDURE ON SCHEMA <db>.<schema> TO ROLE <schema_owner_role>;
@@ -17,7 +17,7 @@ GRANT DATABASE ROLE SNOWFLAKE.CORTEX_USER TO ROLE <schema_owner_role>;   -- AI_C
 GRANT EXECUTE TASK ON ACCOUNT TO ROLE <schema_owner_role>;
 
 -- ── App role (if different from the owner): what the app exercises, no more ──
--- Only adaptive compute: the app uses minidms_wh and nothing else.
+-- Any warehouse works for the app; minidms_wh is the one the setup creates.
 GRANT USAGE ON DATABASE <db> TO ROLE <app_role>;
 GRANT USAGE ON SCHEMA <db>.<schema> TO ROLE <app_role>;
 GRANT USAGE ON WAREHOUSE minidms_wh TO ROLE <app_role>;
@@ -59,8 +59,7 @@ GRANT MONITOR, OPERATE ON TASK <db>.<schema>.process_ai_task TO ROLE <app_role>;
 
 -- ── The app (if not created from a Workspace) ───────────────────────────────
 -- The app runs in <db>.<schema>: the stage and tables above are resolved
--- relative to that schema, so create the app in the same schema. The query
--- warehouse must be the adaptive warehouse.
+-- relative to that schema, so create the app in the same schema.
 -- CREATE STREAMLIT <db>.<schema>.minidms
 --   FROM '@<db>.<schema>.<source_stage_or_repo>/<path>'
 --   MAIN_FILE = 'streamlit_app.py'

@@ -7,7 +7,7 @@ all schema statements are idempotent (IF NOT EXISTS / OR REPLACE on the view).
 import streamlit as st
 
 from app_pages import _connection, _state
-from core import read, setup, write
+from core import setup, write
 from core.session import auth_configured, connection_source, in_sis, setup_allowed
 
 st.title("Setup")
@@ -59,7 +59,7 @@ if can_switch:
         c1, c2, c3 = st.columns(3)
         db = c1.text_input("Database", value=ctx["database"] or "")
         sch = c2.text_input("Schema", value=ctx["schema"] or "MINIDMS")
-        wh = c3.text_input("Warehouse (adaptive)", value="MINIDMS_WH")
+        wh = c3.text_input("Warehouse", value=ctx["warehouse"] or "MINIDMS_WH")
         create = st.checkbox("Create database/schema if missing", value=False)
         if st.button("Apply"):
             try:
@@ -78,17 +78,11 @@ if not ctx["database"] or not ctx["schema"]:
     st.error("No current database/schema. Choose one above (local) or set it in the "
              "connection settings.")
     st.stop()
-try:
-    wh_name, wh_type = read.warehouse_type()
-except Exception:
-    wh_name, wh_type = ctx["warehouse"], None
-if (wh_type or "").upper() != "ADAPTIVE":
-    current_wh = f"`{wh_name}` ({wh_type or 'unknown type'})" if wh_name else "not set"
-    st.warning(f"The current warehouse is {current_wh}. "
-               "MiniDMS runs only on an adaptive warehouse: create `minidms_wh` in the first "
-               "step below, then use it (above, or as the connection's / Streamlit app's "
-               "warehouse). Creating objects needs no warehouse; the documents pages are "
-               "blocked until it is adaptive.", icon="⚠️")
+if not ctx["warehouse"]:
+    st.warning("No warehouse is in use. Creating the objects needs none, but the documents "
+               "pages and the AI task do: create `minidms_wh` (adaptive) in the first step "
+               "below, then use it — here, or as the connection's / Streamlit app's warehouse.",
+               icon="⚠️")
     if can_switch and "minidms_wh" in setup.existing_objects().get("warehouse", set()) \
             and st.button("Use minidms_wh now"):
         try:

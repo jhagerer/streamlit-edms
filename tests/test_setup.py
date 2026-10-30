@@ -69,7 +69,7 @@ def test_hybrid_tables_enforce_keys_and_versions():
     assert "PRIMARY KEY (document_id, tag_id)" in stmts["document_tag"]    # no double attach
 
 
-def test_only_adaptive_compute():
+def test_setup_creates_an_adaptive_warehouse_only_if_missing():
     text = setup.SETUP_SQL.read_text()
     by = {(s.kind, s.name): s.sql for s in setup.setup_statements()}
     assert by[("warehouse", "minidms_wh")].startswith("CREATE ADAPTIVE WAREHOUSE IF NOT EXISTS")

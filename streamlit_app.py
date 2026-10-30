@@ -65,7 +65,7 @@ if error:
     st.page_link(setup_page, label="Open the Setup page", icon="⚙️")
     st.stop()
 
-if not _ui.warehouse_gate():  # only adaptive warehouses
+if not _ui.warehouse_gate():  # any warehouse, but there must be one
     st.stop()
 
 _ui.sidebar()

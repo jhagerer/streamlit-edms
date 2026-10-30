@@ -1,7 +1,7 @@
 -- ─────────────────────────────────────────────────────────────────────────────
 -- MiniDMS — setup
 --
--- Everything the app needs: one adaptive warehouse, one stage, nine hybrid
+-- Everything the app needs: a warehouse (created only if missing), one stage, nine hybrid
 -- tables, five standard tables, four views, and the AI pipeline (one stream,
 -- one procedure, one triggered task). Run once in the database and schema you
 -- already use.
@@ -36,11 +36,13 @@
 
 -- ── Warehouse ────────────────────────────────────────────────────────────────
 
--- The only warehouse MiniDMS uses: for the app's queries (QUERY_WAREHOUSE of the
--- Streamlit app, or the warehouse of a local connection) and for the AI task.
--- Adaptive: Snowflake sizes and scales it per query, so there is no size to pick.
+-- Bootstrap only: in an empty account there is nothing to run queries or the AI
+-- task on, so the setup creates one — adaptive, so there is no size to pick.
+-- IF NOT EXISTS: an existing minidms_wh is left as it is. The app itself runs on
+-- any warehouse (the connection's or the Streamlit app's QUERY_WAREHOUSE); the
+-- AI task below uses minidms_wh (change with ALTER TASK … SET WAREHOUSE).
 CREATE ADAPTIVE WAREHOUSE IF NOT EXISTS minidms_wh
-    COMMENT = 'MiniDMS: app queries, hybrid tables and AI_COMPLETE';
+    COMMENT = 'MiniDMS: created by the setup; runs the AI task';
 
 -- ── Stage ────────────────────────────────────────────────────────────────────
 
@@ -481,8 +483,7 @@ BEGIN
 END;
 $$;
 
--- Triggered task: no schedule, runs when the stream has data, on the adaptive
--- warehouse (no serverless compute).
+-- Triggered task: no schedule, runs when the stream has data, on minidms_wh.
 CREATE OR REPLACE TASK process_ai_task
     COMMENT = 'Runs process_ai() when files are uploaded or reprocessing is requested'
     WAREHOUSE = minidms_wh

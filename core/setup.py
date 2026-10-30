@@ -201,7 +201,7 @@ def create_streamlit_sql(name: str, source: str, warehouse: str, pool: str) -> s
         f"CREATE STREAMLIT {name}\n"
         f"  FROM '{source}'\n"
         "  MAIN_FILE = 'streamlit_app.py'\n"
-        f"  QUERY_WAREHOUSE = {warehouse}  -- the adaptive warehouse\n"
+        f"  QUERY_WAREHOUSE = {warehouse}\n"
         "  RUNTIME_NAME = 'SYSTEM$ST_CONTAINER_RUNTIME_PY3_11'\n"
         f"  COMPUTE_POOL = {pool}\n"
         "  EXTERNAL_ACCESS_INTEGRATIONS = (pypi_eai)\n"
@@ -215,9 +215,10 @@ def steps(text: str | None = None) -> list[Step]:
     by_kind = lambda *k: [s for s in stmts if s.kind in k]  # noqa: E731
     other = [s for s in stmts if s.kind is None]
     out = [
-        Step("warehouse", "Adaptive warehouse",
-             "`minidms_wh` is the only warehouse MiniDMS uses — for the app's queries and for "
-             "the AI task. Adaptive: Snowflake sizes it per query. Needs CREATE WAREHOUSE.",
+        Step("warehouse", "Warehouse (only if missing)",
+             "For an empty account: creates the adaptive warehouse `minidms_wh` if it does not "
+             "exist yet (an existing one is left alone). The AI task runs on it; the app itself "
+             "can run on any warehouse. Needs CREATE WAREHOUSE.",
              by_kind("warehouse")),
         Step("stage", "Stage",
              "`@doc_files` holds uploaded files at `{checksum}/{filename}` (with a directory "
@@ -281,7 +282,7 @@ def _show(session, what: str) -> dict[str, dict] | None:
 
 def existing_objects(session=None) -> dict[str, set[str]]:
     """What exists in the current schema (names lower case), keyed like the
-    statement kinds. ``warehouse`` only lists adaptive warehouses; ``resume``
+    statement kinds. ``resume``
     the started tasks; ``seed`` contains sync_state once all counters exist."""
     tables = db.query(
         "SELECT LOWER(table_name), table_type FROM information_schema.tables "
@@ -306,8 +307,7 @@ def existing_objects(session=None) -> dict[str, set[str]]:
         except Exception:
             pass
     return {
-        "warehouse": {n for n, d in warehouses.items()
-                      if str(d.get("type", "")).upper() == "ADAPTIVE"},
+        "warehouse": set(warehouses),
         "hybrid": set(hybrid) if hybrid is not None else table_names & set(HYBRID_TABLES),
         "table": table_names,
         "view": {r[0] for r in tables if r[1] == "VIEW"},

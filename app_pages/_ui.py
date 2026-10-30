@@ -47,18 +47,14 @@ def show_notices() -> None:
 
 
 def warehouse_gate() -> bool:
-    """Only adaptive warehouses may be used. Shows an error and returns False
-    when the current warehouse is not adaptive."""
-    name, kind = _state.warehouse()
-    if kind and kind.upper() == "ADAPTIVE":
+    """Any warehouse will do — but there must be one. Shows an error and
+    returns False when the session has no warehouse."""
+    name, _ = _state.warehouse()
+    if name:
         return True
-    if name is None:
-        st.error("No warehouse is in use. MiniDMS runs only on an adaptive warehouse "
-                 "(`minidms_wh`).")
-    else:
-        st.error(f"The current warehouse `{name}` is {kind or 'of unknown type'}, not "
-                 "adaptive. MiniDMS runs only on an adaptive warehouse (`minidms_wh`).")
-    st.page_link(SETUP_PAGE, label="Create or select it on the Setup page", icon="⚙️")
+    st.error("No warehouse is in use. Set one in the connection (or the Streamlit app's query "
+             "warehouse) — or let the Setup page create `minidms_wh`.")
+    st.page_link(SETUP_PAGE, label="Open the Setup page", icon="⚙️")
     return False
 
 

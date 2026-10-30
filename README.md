@@ -36,9 +36,10 @@ Schema: [`sql/minidms-setup.sql`](sql/minidms-setup.sql)
    with `AI_COMPLETE` (`claude-sonnet-4-5`). The app never calls Cortex — the AI calls
    take seconds to minutes and would block the shared Snowflake session for every
    viewer, and calling it from the app would lose the lineage.
-5. **Only adaptive compute.** One adaptive warehouse, `minidms_wh`, runs the app's queries
-   and the AI task. The app refuses to run on any other kind of warehouse; there are no
-   serverless tasks.
+5. **Any warehouse; adaptive only for bootstrapping.** The app runs on whatever warehouse
+   the connection (or the Streamlit app) uses. For an empty account, the setup creates the
+   adaptive warehouse `minidms_wh` if it does not exist; the AI task runs on it (change
+   with `ALTER TASK … SET WAREHOUSE`). No serverless tasks.
 6. **Caching where it is cheap and safe.** The current-state tables are small (one row
    per entity) and are loaded whole into polars frames, cached and shared by all
    viewers. The cache key is the table's counter in `sync_state`, read with one point
@@ -90,7 +91,7 @@ multipage detection does not interfere with `st.navigation`.
 Two ways — both run the same idempotent statements (nothing is ever dropped):
 
 **A. From the app: System → Setup.** The page works before any MiniDMS object (and
-before the adaptive warehouse) exists; when the schema is missing, every other page
+before any warehouse) exists; when the schema is missing, every other page
 links to it. It walks through:
 
 1. **Connection** — shows account, user, role, warehouse, database, schema and where
@@ -99,7 +100,8 @@ links to it. It walks through:
    or browser SSO on your own computer), generate a key pair, render a `secrets.toml`,
    switch database/schema/warehouse, and disconnect/reconnect. In Streamlit in Snowflake
    there is nothing to enter.
-2. **Adaptive warehouse** — `minidms_wh` (then *Use minidms_wh now*)
+2. **Warehouse, only if missing** — creates the adaptive `minidms_wh` if it does not exist
+   (then *Use minidms_wh now* when the session has no warehouse)
 3. **Stage** — `@doc_files`
 4. **Hybrid tables** — the nine tables people edit, plus filling `sync_state`
 5. **Standard tables** — `stored_file`, `ai_request`, `document_text`,
@@ -117,7 +119,7 @@ links to it. It walks through:
 
 Every statement is shown before it runs; each has its own *Run* button, and every step
 has *Run all*. A progress bar shows how many of the 25 objects exist (including whether
-the warehouse is adaptive and the task is started); a log shows each result.
+the task is started); a log shows each result.
 
 Who may run the setup statements: on a local run, you; with credentials you entered
 yourself, you (Snowflake's privileges decide what succeeds). In Streamlit in Snowflake,
@@ -138,8 +140,7 @@ shared connection, only the users listed in `MINIDMS_SETUP_USERS`.
    `requirements.txt` from PyPI; without the integration it will not start.
 3. Create the app **in the same schema** as the MiniDMS tables. The app uses
    unqualified names (`document`, `@doc_files`, …).
-4. Set the app's **query warehouse to `minidms_wh`** (adaptive). The app refuses to run on
-   any other kind of warehouse.
+4. Set the app's **query warehouse** — any warehouse works, e.g. `minidms_wh` from the setup.
 5. Check: `DESC STREAMLIT <name>` shows the container runtime and a compute pool.
    Open **Diagnostics** as two different users — the *Viewer (actor)* must differ.
 
@@ -160,8 +161,8 @@ streamlit run streamlit_app.py
 The connection is created with `st.connection("snowflake")`. It reads
 `[connections.snowflake]` from `.streamlit/secrets.toml`, or else your default
 connection in `~/.snowflake/connections.toml`. The connection must set a
-**database and schema** where the MiniDMS objects live, and the warehouse
-**`MINIDMS_WH`** (adaptive) — or set `MINIDMS_WAREHOUSE=MINIDMS_WH`.
+**database and schema** where the MiniDMS objects live, and a warehouse (any; or set
+`MINIDMS_WAREHOUSE`, e.g. to `MINIDMS_WH` from the setup).
 
 Optional environment variables:
 
@@ -245,7 +246,7 @@ same primary keys as the hybrid tables, so transactions, rollbacks, version conf
 idempotent retries behave for real. They cover the write commands (one transaction per
 action, conflicts, retries, provenance), the change counters and caches, the per-session
 lock, the AI state per file and the suggestions, search, the setup script (it must match
-`core/schema.py` column for column; adaptive-only compute; lineage-friendly
+`core/schema.py` column for column; warehouse bootstrap; lineage-friendly
 `INSERT … SELECT`), grants, connection settings, the login and warehouse gates, and the
 real pages driven with Streamlit's `AppTest` — including concurrent edits by two users.
 
@@ -308,10 +309,9 @@ Edits to *different* things (two metadata fields, two tags) do not conflict.
 
 These could not be verified without a Snowflake account. Please check them once:
 
-1. `CREATE ADAPTIVE WAREHOUSE` is available to your role, and a **triggered task with
-   `WAREHOUSE = minidms_wh`** runs on an adaptive warehouse.
-2. **Hybrid tables** are available in your account/region, and transactions on them run
-   on the adaptive warehouse; the app's `UPDATE … WHERE version = ?` returns the number of
+1. `CREATE ADAPTIVE WAREHOUSE` is available to your role (only needed if `minidms_wh` does
+   not exist), and a **triggered task with `WAREHOUSE = minidms_wh`** runs on it.
+2. **Hybrid tables** are available in your account/region; the app's `UPDATE … WHERE version = ?` returns the number of
    rows updated, and a duplicate primary key raises an error mentioning the duplicate key.
 3. `process_ai()` compiles and works: upload one PDF, then check
    `SELECT * FROM ai_status_v;` and `TABLE(INFORMATION_SCHEMA.TASK_HISTORY(TASK_NAME =>
