@@ -11,7 +11,7 @@ session; it caches *query results* where that is cheap and safe:
   no counters to maintain. One query per rerun reads all of them.
 * A TTL is an extra safety net.
 
-document_text and page_ocr (large OCR text) and the history are never
+document_text_current and page_ocr (large OCR text) and the history are never
 bulk-loaded; they are queried per document (search: Cortex Search).
 """
 
