@@ -43,17 +43,13 @@ def seed(fake):
     write.register_files("bob", [stored(name="a.txt")])
     fake.stage[stored(name="a.txt")["stage_path"].lstrip("@")] = b"hello"
     # What process_ai() would have written inside Snowflake:
-    fake.conn.execute(
-        "INSERT INTO document_text (event_id, extracted_at, actor, file_id, model, status, pages, "
-        "content) VALUES ('t1', '2020-01-02 00:00:00.000000', 'system:ai', 'f1', "
-        "'claude-haiku-4-5', 'done', 1, '--- Page 1 ---\nInvoice no. 42, total 99 EUR')")
-    fake.conn.execute(
-        "INSERT INTO document_enrichment (event_id, created_at, actor, file_id, document_id, model, "
-        "status, summary, suggested_type_id, suggested_tag_ids, extracted_metadata) VALUES "
-        "('enr1', '2020-01-02 00:00:01.000000', 'system:ai', 'f1', 'd1', 'claude-sonnet-4-5', "
-        "'done', 'An invoice over 99 EUR.', 't2', '[\"blue\"]', "
-        "'[{\"metadata_type_id\": \"m1\", \"value\": \"99\"}]')")
     req = fake.rows("SELECT event_id FROM ai_request")[0]["event_id"]
+    fake.conn.execute(
+        "INSERT INTO document_enrichment (file_id, run_id, event_id, created_at, actor, "
+        "document_id, model, status, summary, suggested_type_id, suggested_tag_ids, "
+        "extracted_metadata) VALUES ('f1', ?, 'enr1', '2020-01-02 00:00:01.000000', 'system:ai', "
+        "'d1', 'claude-sonnet-4-5', 'done', 'An invoice over 99 EUR.', 't2', '[\"blue\"]', "
+        "'[{\"metadata_type_id\": \"m1\", \"value\": \"99\"}]')", [req])
     fake.conn.execute("INSERT INTO ai_job_log (event_id, event_ts, request_id, file_id, "
                       "document_id, step) VALUES ('j1', '2020-01-02 00:00:02.000000', ?, 'f1', "
                       "'d1', 'finished')", [req])
@@ -200,10 +196,10 @@ def test_missing_schema_points_to_setup_and_setup_creates_it(fake):
     at.switch_page("app_pages/setup.py").run()
     assert not at.exception, at.exception
     assert at.title[0].value == "Setup"
-    click(at.button, "Run all 7 statement(s) of this step")     # the hybrid logs
+    click(at.button, "Run all 8 statement(s) of this step")     # the hybrid tables
     at.run()
     assert not at.exception, at.exception
-    assert sum(q.startswith("CREATE HYBRID TABLE") for q in fake.executed) == 7
+    assert sum(q.startswith("CREATE HYBRID TABLE") for q in fake.executed) == 8
 
     at.switch_page("app_pages/documents.py").run()
     assert not at.exception, at.exception
@@ -350,4 +346,6 @@ def test_text_tab_shows_structured_pages(fake):
     assert [s.value for s in at.selectbox if s.label == "Page"] == [1]
     shown = " ".join(m.value for m in at.markdown)
     assert "Invoice 42 over 99 EUR." in shown and "ACME logo" in shown
-    assert any(t.value == "Invoice no. 42, total 99 EUR" for t in at.text_area)
+    assert any(t.value == "Invoice no. 42, total 99 EUR" for t in at.text_area)        # the page
+    assert any(t.value == "--- Page 1 ---\nInvoice no. 42, total 99 EUR"                # the view
+               for t in at.text_area)

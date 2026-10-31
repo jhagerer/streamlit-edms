@@ -2,7 +2,7 @@
 -- MiniDMS — setup
 --
 -- Everything the app needs: a warehouse (created only if missing), one stage,
--- seven hybrid tables, eight standard tables, a dozen views, the AI pipeline
+-- eight hybrid tables, six standard tables, a dozen views, the AI pipeline
 -- (one stream, four functions, three procedures, one triggered task) and one
 -- Cortex Search service.
 -- Run once in the database and schema you already use.
@@ -19,17 +19,20 @@
 --                     the same record — the second insert fails and the app
 --                     reports a conflict. UNIQUE (event_id) makes a retried
 --                     action fail as a whole, so it is never applied twice.
---   Standard tables — immutable facts and AI output: uploaded files, AI
---                     requests, the PDF pages, the structured OCR per page,
---                     the text and the enrichments. Every pipeline row is
---                     written by INSERT … SELECT from its sources inside
---                     Snowflake, so Snowflake records column-level lineage from
---                     the upload to the pages, the OCR fields, the text, the
---                     summary and the suggestions (see the AI pipeline section).
---   Cortex Search   — the sink of the ingest pipeline: every file is converted
---                     to PDF and split into pages, every page gets a
---                     structured OCR (AI_COMPLETE, claude-haiku-4-5), and the
---                     service indexes one search document per page.
+--                     Plus document_enrichment, the AI result people act on.
+--   Standard tables — immutable facts and pipeline steps: uploaded files, AI
+--                     requests, the PDF pages and the structured OCR per page
+--                     (the source of the search service).
+--
+-- The ingest pipeline has two sinks:
+--   · the Cortex Search service document_search — every file is converted to
+--     PDF and split into pages, every page gets a structured OCR
+--     (AI_COMPLETE, claude-haiku-4-5) in page_ocr, and the service indexes one
+--     search document per page;
+--   · the hybrid table document_enrichment — summary, type and tag
+--     suggestions and metadata per file (AI_COMPLETE, claude-sonnet-4-5).
+-- Every pipeline row is written by INSERT … SELECT from its sources, so
+-- Snowflake records column-level lineage (see the AI pipeline section).
 --
 -- Idempotent. Tables, the stream and the search service use IF NOT EXISTS so
 -- re-running never drops data, resets the stream offset or rebuilds the index;
@@ -191,6 +194,32 @@ CREATE HYBRID TABLE IF NOT EXISTS tag_assignment_log (
     UNIQUE (event_id)
 )   COMMENT = 'Append-only. Tag assignments; latest version per (document, tag) is current.';
 
+-- ── Hybrid table: AI enrichment, a sink of the ingest pipeline ───────────────
+--
+-- Summary, document-type / tag suggestions and extracted metadata per file and
+-- processing run, from AI_COMPLETE (claude-sonnet-4-5). Written by
+-- INSERT … SELECT FROM document_text_current (+ the current definitions), so
+-- every column is lineage-linked to the page OCR. Hybrid, because the app
+-- reads it one document at a time and people act on it (Apply); the keys make
+-- the pipeline idempotent: one result per file and run, never two.
+CREATE HYBRID TABLE IF NOT EXISTS document_enrichment (
+    file_id            VARCHAR       NOT NULL,
+    run_id             VARCHAR       NOT NULL,  -- the ai_request it came from
+    event_id           VARCHAR       NOT NULL,
+    created_at         TIMESTAMP_NTZ NOT NULL,
+    actor              VARCHAR       NOT NULL,  -- 'system:ai'
+    document_id        VARCHAR       NOT NULL,
+    model              VARCHAR,
+    status             VARCHAR       NOT NULL,  -- done | failed | skipped
+    summary            VARCHAR,
+    suggested_type_id  VARCHAR,
+    suggested_tag_ids  ARRAY,
+    extracted_metadata ARRAY,                   -- [{metadata_type_id, value}]
+    error              VARCHAR,
+    PRIMARY KEY (file_id, run_id),
+    UNIQUE (event_id)
+)   COMMENT = 'Append-only. AI enrichment per file and run; latest run per file wins.';
+
 -- ── Standard tables: immutable facts and AI output ───────────────────────────
 
 -- One row per uploaded file. Never changed. The source of the lineage chain.
@@ -267,38 +296,6 @@ CREATE TABLE IF NOT EXISTS page_ocr (
 )   CHANGE_TRACKING = TRUE
     COMMENT = 'Append-only. Structured OCR per page; indexed by the document_search service.';
 
--- The OCR text of the whole file: the pages of one run in order. Written by
--- INSERT … SELECT FROM page_ocr. Input of the enrichment and the Text tab.
-CREATE TABLE IF NOT EXISTS document_text (
-    event_id     VARCHAR       NOT NULL,
-    extracted_at TIMESTAMP_NTZ NOT NULL,
-    actor        VARCHAR       NOT NULL,      -- 'system:ai'
-    file_id      VARCHAR       NOT NULL,
-    model        VARCHAR,
-    status       VARCHAR       NOT NULL,      -- done | failed | skipped
-    pages        NUMBER,
-    content      VARCHAR,
-    error        VARCHAR
-)   COMMENT = 'Append-only. OCR text per file; latest row per file_id wins.';
-
--- Summary, document-type / tag suggestions and extracted metadata from
--- AI_COMPLETE. Written by INSERT … SELECT FROM document_text (+ the current
--- definitions), so every column is lineage-linked to its sources.
-CREATE TABLE IF NOT EXISTS document_enrichment (
-    event_id           VARCHAR       NOT NULL,
-    created_at         TIMESTAMP_NTZ NOT NULL,
-    actor              VARCHAR       NOT NULL,  -- 'system:ai'
-    file_id            VARCHAR       NOT NULL,
-    document_id        VARCHAR       NOT NULL,
-    model              VARCHAR,
-    status             VARCHAR       NOT NULL,  -- done | failed | skipped
-    summary            VARCHAR,
-    suggested_type_id  VARCHAR,
-    suggested_tag_ids  ARRAY,
-    extracted_metadata ARRAY,                   -- [{metadata_type_id, value}]
-    error              VARCHAR
-)   COMMENT = 'Append-only. AI enrichment per file; latest row per file_id wins.';
-
 -- What process_ai() did: one row when a request is taken from the stream
 -- (queued) and one when it is finished.
 CREATE TABLE IF NOT EXISTS ai_job_log (
@@ -369,17 +366,62 @@ SELECT document_id, tag_id, assigned, version,
 FROM tag_assignment_log
 QUALIFY ROW_NUMBER() OVER (PARTITION BY document_id, tag_id ORDER BY version DESC) = 1;
 
+-- The OCR text of every file: the pages of its latest run in order, or, when
+-- that run has no pages, why not (from pdf_conversion). Not a table — it only
+-- joins what page_ocr already holds; lineage runs through the view.
 CREATE OR REPLACE VIEW document_text_current
-    COMMENT = 'Latest OCR result per file.'
+    COMMENT = 'OCR text per file: the pages of its latest run in order.'
 AS
-SELECT *
-FROM document_text
-QUALIFY ROW_NUMBER() OVER (PARTITION BY file_id ORDER BY extracted_at DESC, event_id DESC) = 1;
+WITH runs AS (
+    SELECT file_id, run_id, MIN(created_at) AS started_at FROM page_ocr GROUP BY file_id, run_id
+    UNION ALL
+    SELECT file_id, run_id, MIN(created_at) FROM pdf_conversion GROUP BY file_id, run_id
+),
+latest AS (
+    SELECT file_id, run_id
+    FROM runs
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY file_id ORDER BY started_at DESC, run_id DESC) = 1
+),
+pages AS (
+    SELECT file_id, run_id,
+           MAX(created_at)                  AS extracted_at,
+           MAX(model)                       AS model,
+           COUNT(page_no)                   AS pages,
+           COUNT_IF(status <> 'done')       AS failed_pages,
+           ANY_VALUE(error)                 AS error,
+           LISTAGG('--- Page ' || page_no || ' ---\n' || COALESCE(ocr_text, ''), '\n\n')
+               WITHIN GROUP (ORDER BY page_no) AS content
+    FROM page_ocr
+    GROUP BY file_id, run_id
+),
+conversion AS (
+    SELECT file_id, run_id, created_at, status, page_count, error
+    FROM pdf_conversion
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY file_id, run_id ORDER BY created_at DESC) = 1
+)
+SELECT l.file_id,
+       l.run_id,
+       COALESCE(p.extracted_at, c.created_at)                       AS extracted_at,
+       p.model,
+       CASE WHEN c.status = 'failed' THEN 'failed'
+            WHEN p.pages > 0 AND p.failed_pages > 0 THEN 'failed'
+            WHEN p.pages > 0 THEN 'done'
+            ELSE 'skipped' END                                      AS status,
+       COALESCE(p.pages, 0)                                         AS pages,
+       p.content,
+       CASE WHEN c.status = 'failed' THEN c.error
+            WHEN p.failed_pages > 0
+                THEN p.failed_pages || ' of ' || p.pages || ' pages failed: ' || p.error
+            WHEN p.pages IS NULL THEN COALESCE(c.error, 'no pages') END AS error
+FROM latest l
+LEFT JOIN pages      p ON p.file_id = l.file_id AND p.run_id = l.run_id
+LEFT JOIN conversion c ON c.file_id = l.file_id AND c.run_id = l.run_id;
 
 CREATE OR REPLACE VIEW document_enrichment_current
     COMMENT = 'Latest enrichment per file.'
 AS
-SELECT *
+SELECT file_id, run_id, event_id, created_at, actor, document_id, model, status, summary,
+       suggested_type_id, suggested_tag_ids, extracted_metadata, error
 FROM document_enrichment
 QUALIFY ROW_NUMBER() OVER (PARTITION BY file_id ORDER BY created_at DESC, event_id DESC) = 1;
 
@@ -433,7 +475,9 @@ UNION ALL SELECT event_ts, actor, op, 'metadata_type', NULL, metadata_type_id FR
 UNION ALL SELECT event_ts, actor, op, 'tag_definition', NULL, tag_id FROM tag_log
 UNION ALL SELECT uploaded_at,  uploaded_by, 'upload',            'stored_file',         document_id, file_id FROM stored_file
 UNION ALL SELECT created_at,   'system:ai', 'convert_' || status, 'pdf_conversion',     NULL,        file_id FROM pdf_conversion
-UNION ALL SELECT extracted_at, actor,       'ocr_' || status,    'document_text',       NULL,        file_id FROM document_text
+UNION ALL SELECT MIN(created_at), 'system:ai',
+                 'ocr_' || IFF(COUNT_IF(status <> 'done') > 0, 'failed', 'done'),
+                 'page_ocr', ANY_VALUE(document_id), file_id FROM page_ocr GROUP BY file_id, run_id
 UNION ALL SELECT created_at,   actor,       'enrich_' || status, 'document_enrichment', document_id, file_id FROM document_enrichment;
 
 -- ── AI pipeline: stream + functions + procedures + triggered task ────────────
@@ -455,12 +499,14 @@ UNION ALL SELECT created_at,   actor,       'enrich_' || status, 'document_enric
 --           every page file, as INSERT … SELECT FROM pdf_page — the pages run
 --           in parallel. If that statement fails, the pages are retried one by
 --           one so one bad page gets a 'failed' row instead of failing the file;
---      b. text — the pages' ocr_text in order, as INSERT … SELECT FROM page_ocr;
---      c. enrichment — AI_COMPLETE (claude-sonnet-4-5) with a JSON schema over
---         the text and the current definitions, as INSERT … SELECT FROM
---         document_text;
---      d. log 'finished'.
---   page_ocr is the sink: the Cortex Search service indexes its index_text.
+--      b. enrichment — AI_COMPLETE (claude-sonnet-4-5) with a JSON schema over
+--         the text (the view document_text_current: the pages' ocr_text in
+--         order) and the current definitions, as INSERT … SELECT into the
+--         hybrid table document_enrichment; skipped if this run already has
+--         a result (PRIMARY KEY (file_id, run_id));
+--      c. log 'finished'.
+--   Sinks: the Cortex Search service (over page_ocr.index_text) and the hybrid
+--   table document_enrichment.
 --   One failing file never blocks the others: it gets 'failed' rows with the
 --   error message. Only INSERTs: append-only.
 --
@@ -475,7 +521,7 @@ UNION ALL SELECT created_at,   actor,       'enrich_' || status, 'document_enric
 --               ─► pdf_page (page_no, stage_path)
 --               ─► page_ocr (ocr_text, headings_list, image_short_summaries_list,
 --                            table_summaries_list, page_short_summary, index_text)
---               ─► document_text.content, pages
+--               ─► document_text_current.content (view)
 --               ─► document_enrichment (summary, suggested_type_id, suggested_tag_ids,
 --                                       extracted_metadata)  + the definition views
 --   page_ocr.index_text ─► Cortex Search service document_search
@@ -863,51 +909,32 @@ BEGIN
                 END IF;
             END IF;
 
-            -- 2b. Text: the pages in order, or why there are none.
-            INSERT INTO document_text (event_id, extracted_at, actor, file_id, model, status,
-                                       pages, content, error)
-            SELECT UUID_STRING(), SYSDATE(), 'system:ai', o.file_id, MAX(o.model),
-                   IFF(COUNT_IF(o.status <> 'done') > 0, 'failed', 'done'),
-                   COUNT(o.page_no),
-                   LISTAGG('--- Page ' || o.page_no || ' ---\n' || COALESCE(o.ocr_text, ''), '\n\n')
-                       WITHIN GROUP (ORDER BY o.page_no),
-                   IFF(COUNT_IF(o.status <> 'done') > 0,
-                       COUNT_IF(o.status <> 'done') || ' of ' || COUNT(o.page_no)
-                       || ' pages failed: ' || ANY_VALUE(o.error), NULL)
-            FROM page_ocr o
-            WHERE o.run_id = :v_req AND o.file_id = :v_fid
-            GROUP BY o.file_id;
-            v_n := SQLROWCOUNT;
-            IF (v_n = 0) THEN
-                INSERT INTO document_text (event_id, extracted_at, actor, file_id, model, status,
-                                           pages, error)
-                SELECT UUID_STRING(), SYSDATE(), 'system:ai', c.file_id, NULL,
-                       IFF(c.status = 'failed', 'failed', 'skipped'), COALESCE(c.page_count, 0),
-                       COALESCE(c.error, 'no pages')
-                FROM pdf_conversion c
-                WHERE c.run_id = :v_req AND c.file_id = :v_fid;
-            END IF;
         EXCEPTION
             WHEN OTHER THEN
+                -- Unexpected error: record it on the run, so the file shows as failed.
                 v_msg := SQLERRM;
-                INSERT INTO document_text (event_id, extracted_at, actor, file_id, model, status, error)
-                SELECT UUID_STRING(), SYSDATE(), 'system:ai', r.file_id, 'claude-haiku-4-5',
-                       'failed', :v_msg
+                INSERT INTO pdf_conversion (event_id, created_at, run_id, file_id, status, error)
+                SELECT UUID_STRING(), SYSDATE(), r.event_id, r.file_id, 'failed', :v_msg
                 FROM ai_request r WHERE r.event_id = :v_req;
         END;
 
-        -- 2c. Enrichment: summary, type + tag suggestions, metadata extraction.
+        -- 2b. Enrichment: summary, type + tag suggestions, metadata extraction.
+        --     At most one result per file and run (PRIMARY KEY): if this run
+        --     was already enriched (a rerun after an interruption), skip it.
+        v_n := (SELECT COUNT(*) FROM document_enrichment WHERE file_id = :v_fid AND run_id = :v_req);
+        IF (v_n = 0) THEN
         BEGIN
-            INSERT INTO document_enrichment (event_id, created_at, actor, file_id, document_id, model,
-                                             status, summary, suggested_type_id, suggested_tag_ids,
-                                             extracted_metadata)
-            SELECT UUID_STRING(), SYSDATE(), 'system:ai', x.file_id, x.document_id, 'claude-sonnet-4-5', 'done',
+            INSERT INTO document_enrichment (file_id, run_id, event_id, created_at, actor, document_id,
+                                             model, status, summary, suggested_type_id,
+                                             suggested_tag_ids, extracted_metadata)
+            SELECT x.file_id, x.run_id, UUID_STRING(), SYSDATE(), 'system:ai', x.document_id,
+                   'claude-sonnet-4-5', 'done',
                    x.j:summary::VARCHAR,
                    NULLIF(x.j:document_type_id::VARCHAR, ''),
                    x.j:tag_ids::ARRAY,
                    x.j:metadata::ARRAY
             FROM (
-                SELECT t.file_id, r.document_id,
+                SELECT t.file_id, t.run_id, r.document_id,
                        TRY_PARSE_JSON(TO_VARCHAR(AI_COMPLETE(
                            model => 'claude-sonnet-4-5',
                            prompt => 'You are filing a document in a document management system. '
@@ -949,30 +976,31 @@ BEGIN
                                }
                            }))) AS j
                 FROM document_text_current t
-                JOIN ai_request r ON r.file_id = t.file_id
+                JOIN ai_request r ON r.event_id = t.run_id AND r.file_id = t.file_id
                 WHERE r.event_id = :v_req AND LENGTH(t.content) > 0
             ) x;
             v_n := SQLROWCOUNT;
             IF (v_n = 0) THEN
-                INSERT INTO document_enrichment (event_id, created_at, actor, file_id, document_id,
-                                                 model, status, error)
-                SELECT UUID_STRING(), SYSDATE(), 'system:ai', r.file_id, r.document_id, NULL, 'skipped',
-                       'No text to enrich'
+                INSERT INTO document_enrichment (file_id, run_id, event_id, created_at, actor,
+                                                 document_id, model, status, error)
+                SELECT r.file_id, r.event_id, UUID_STRING(), SYSDATE(), 'system:ai', r.document_id,
+                       NULL, 'skipped', 'No text to enrich'
                 FROM ai_request r WHERE r.event_id = :v_req;
             END IF;
             v_done := v_done + 1;
         EXCEPTION
             WHEN OTHER THEN
                 v_msg := SQLERRM;
-                INSERT INTO document_enrichment (event_id, created_at, actor, file_id, document_id,
-                                                 model, status, error)
-                SELECT UUID_STRING(), SYSDATE(), 'system:ai', r.file_id, r.document_id,
+                INSERT INTO document_enrichment (file_id, run_id, event_id, created_at, actor,
+                                                 document_id, model, status, error)
+                SELECT r.file_id, r.event_id, UUID_STRING(), SYSDATE(), 'system:ai', r.document_id,
                        'claude-sonnet-4-5', 'failed', :v_msg
                 FROM ai_request r WHERE r.event_id = :v_req;
                 v_failed := v_failed + 1;
         END;
+        END IF;
 
-        -- 2d. Done.
+        -- 2c. Done.
         INSERT INTO ai_job_log (event_id, event_ts, request_id, file_id, document_id, step, message)
         SELECT UUID_STRING(), SYSDATE(), r.event_id, r.file_id, r.document_id, 'finished', :v_msg
         FROM ai_request r WHERE r.event_id = :v_req;

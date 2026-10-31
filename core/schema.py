@@ -3,11 +3,11 @@
 Pure: polars only. One global state lives in Snowflake, and every table is
 append-only:
 
-* hybrid tables — everything people edit; one row per version, the current
-  state is the latest version per key (the *_current views);
-* standard tables — immutable facts and AI output (lineage): the files, their
-  PDF pages and the structured OCR per page that feeds the Cortex Search
-  service.
+* hybrid tables — everything people edit (one row per version, the current
+  state is the latest version per key, the *_current views), plus
+  document_enrichment, the AI result people act on (one row per file and run);
+* standard tables — immutable facts and pipeline steps: the files, their PDF
+  pages and the structured OCR per page that feeds the Cortex Search service.
 
 Every frame the app loads goes through ``conform()`` so dtypes are pinned in
 one place.
@@ -18,7 +18,7 @@ from __future__ import annotations
 import polars as pl
 
 # Human-edited data. Append-only: PRIMARY KEY (key…, version), UNIQUE (event_id).
-HYBRID_TABLES: tuple[str, ...] = (
+LOG_TABLES: tuple[str, ...] = (
     "document_type_log",
     "metadata_type_log",
     "tag_log",
@@ -28,6 +28,13 @@ HYBRID_TABLES: tuple[str, ...] = (
     "tag_assignment_log",
 )
 
+# Hybrid tables written by the ingest pipeline (a sink), with their keys.
+PIPELINE_KEYS: dict[str, tuple[str, ...]] = {
+    "document_enrichment": ("file_id", "run_id"),
+}
+
+HYBRID_TABLES: tuple[str, ...] = LOG_TABLES + tuple(PIPELINE_KEYS)
+
 # Immutable facts and AI output. Append-only; written by INSERT (… SELECT).
 STANDARD_TABLES: tuple[str, ...] = (
     "stored_file",
@@ -35,8 +42,6 @@ STANDARD_TABLES: tuple[str, ...] = (
     "pdf_conversion",
     "pdf_page",
     "page_ocr",
-    "document_text",
-    "document_enrichment",
     "ai_job_log",
 )
 
@@ -62,8 +67,8 @@ SEARCH_SERVICE = "document_search"
 TOKEN_TABLES: tuple[str, ...] = HYBRID_TABLES + STANDARD_TABLES
 
 # Views the app bulk-loads (small: one row per entity or per file), with the
-# tables whose change tokens they depend on. document_text and page_ocr (the
-# large OCR text) and the history are never bulk-loaded.
+# tables whose change tokens they depend on. document_text_current and page_ocr
+# (the large OCR text) and the history are never bulk-loaded.
 LOADED: dict[str, tuple[str, ...]] = {
     "document_type_current": ("document_type_log",),
     "metadata_type_current": ("metadata_type_log",),
@@ -73,7 +78,8 @@ LOADED: dict[str, tuple[str, ...]] = {
     "metadata_current": ("metadata_log",),
     "tag_assignment_current": ("tag_assignment_log",),
     "stored_file": ("stored_file",),
-    "ai_status_v": ("ai_request", "document_text", "document_enrichment", "ai_job_log"),
+    "ai_status_v": ("ai_request", "pdf_conversion", "page_ocr", "document_enrichment",
+                    "ai_job_log"),
     "document_enrichment_current": ("document_enrichment",),
 }
 
@@ -120,13 +126,9 @@ COLUMNS: dict[str, dict[str, pl.DataType]] = {
         "event_id": S, "requested_at": TS, "actor": S, "file_id": S, "document_id": S,
         "reason": S,
     },
-    "document_text": {
-        "event_id": S, "extracted_at": TS, "actor": S, "file_id": S, "model": S, "status": S,
-        "pages": I, "content": S, "error": S,
-    },
     "document_enrichment": {
-        "event_id": S, "created_at": TS, "actor": S, "file_id": S, "document_id": S,
-        "model": S, "status": S, "summary": S, "suggested_type_id": S,
+        "file_id": S, "run_id": S, "event_id": S, "created_at": TS, "actor": S,
+        "document_id": S, "model": S, "status": S, "summary": S, "suggested_type_id": S,
         "suggested_tag_ids": S, "extracted_metadata": S, "error": S,   # ARRAYs arrive as JSON text
     },
     "pdf_conversion": {
@@ -175,7 +177,10 @@ COLUMNS: dict[str, dict[str, pl.DataType]] = {
         "version": I, "value": S, "source": S,
     },
 }
-COLUMNS["document_text_current"] = COLUMNS["document_text"]
+COLUMNS["document_text_current"] = {
+    "file_id": S, "run_id": S, "extracted_at": TS, "model": S, "status": S, "pages": I,
+    "content": S, "error": S,
+}
 COLUMNS["document_enrichment_current"] = COLUMNS["document_enrichment"]
 
 DOCUMENT_STATUSES = ("active", "trashed")

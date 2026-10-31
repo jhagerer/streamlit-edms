@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from core import db
-from core.schema import HYBRID_TABLES, STANDARD_TABLES
+from core.schema import HYBRID_TABLES, LOG_TABLES, STANDARD_TABLES
 from core.schema import VIEWS as SCHEMA_VIEWS
 
 SETUP_SQL = Path(__file__).resolve().parents[1] / "sql" / "minidms-setup.sql"
@@ -158,9 +158,9 @@ def grant_statements(role: str, database: str, schema: str,
         stmts.append(f"GRANT USAGE ON WAREHOUSE {warehouse} TO ROLE {role}")
     stmts += [f"GRANT READ, WRITE ON STAGE {sch}.{s} TO ROLE {role}" for s in STAGES]
     stmts += [f"GRANT SELECT, INSERT ON TABLE {sch}.{t} TO ROLE {role}"
-              for t in HYBRID_TABLES + APP_APPENDED]
+              for t in LOG_TABLES + APP_APPENDED]
     stmts += [f"GRANT SELECT ON TABLE {sch}.{t} TO ROLE {role}"   # written only by process_ai()
-              for t in STANDARD_TABLES if t not in APP_APPENDED]
+              for t in HYBRID_TABLES + STANDARD_TABLES if t not in LOG_TABLES + APP_APPENDED]
     stmts += [f"GRANT SELECT ON VIEW {sch}.{v} TO ROLE {role}" for v in VIEWS]
     stmts += [f"GRANT USAGE ON CORTEX SEARCH SERVICE {sch}.{s} TO ROLE {role}"
               for s in SEARCH_SERVICES]
@@ -213,20 +213,23 @@ def steps(text: str | None = None) -> list[Step]:
              "at `{checksum}/derived/` (with a directory table and server-side encryption, "
              "which AI_COMPLETE needs to read them).",
              by_kind("stage")),
-        Step("hybrid", "Hybrid tables (what people edit, append-only)",
+        Step("hybrid", "Hybrid tables (what people edit and act on, append-only)",
              "Documents, metadata values, tag assignments, file attachments and the "
              "definitions. One row per version — nothing is updated or deleted. "
              "PRIMARY KEY (id, version) makes concurrent edits collide instead of overwriting "
-             "each other; UNIQUE (event_id) makes every action idempotent.",
+             "each other; UNIQUE (event_id) makes every action idempotent. Plus "
+             "`document_enrichment`, a sink of the ingest pipeline: the AI summary and "
+             "suggestions, one row per file and run (PRIMARY KEY (file_id, run_id)).",
              by_kind("hybrid")),
-        Step("standard", "Standard tables (files, pages, AI output)",
-             "Uploaded files, AI requests, the PDF conversion and pages, the structured OCR per "
-             "page, the text and the enrichments: append-only; the AI output is written by "
-             "INSERT … SELECT inside Snowflake, so it carries column-level lineage.",
+        Step("standard", "Standard tables (files, pages, page OCR)",
+             "Uploaded files, AI requests, the PDF conversion and pages, and the structured OCR "
+             "per page (`page_ocr`, the source of the Cortex Search service): append-only; the "
+             "pipeline writes them by INSERT … SELECT inside Snowflake, so they carry "
+             "column-level lineage.",
              by_kind("table")),
         Step("views", "Views",
-             "The current state (latest version per key), the latest OCR text and enrichment "
-             "per file, the AI state per file, the per-document history and the audit trail. "
+             "The current state (latest version per key), the OCR text per file (the pages in "
+             "order, from `page_ocr`), the latest enrichment per file, the AI state per file, the per-document history and the audit trail. "
              "`OR REPLACE` is safe — views hold no data.",
              by_kind("view")),
         Step("pipeline", "AI pipeline (stream + triggered task)",
@@ -234,7 +237,8 @@ def steps(text: str | None = None) -> list[Step]:
              "file is uploaded; it calls `process_ai()`: every file is converted to PDF and "
              "split into pages (Python procedure), every page gets a structured OCR with "
              "AI_COMPLETE (claude-haiku-4-5) into `page_ocr`, then AI_COMPLETE "
-             "(claude-sonnet-4-5) writes the summary, type and tag suggestions and metadata. "
+             "(claude-sonnet-4-5) writes the summary, type and tag suggestions and metadata "
+             "to the hybrid table `document_enrichment`. "
              "The owning role needs CREATE STREAM/TASK/FUNCTION/PROCEDURE, EXECUTE TASK, USAGE on the "
              "warehouse, SNOWFLAKE.CORTEX_USER and the Anaconda terms accepted. The last "
              "statement resumes the task. Every row is written by INSERT … SELECT from its "

@@ -58,9 +58,32 @@ VIEWS_SQL = [
         "tag_assignment_log", "document_id,tag_id",
         "document_id, tag_id, assigned, event_ts AS assigned_at, actor AS assigned_by",
         created=False),
-    """CREATE VIEW document_text_current AS SELECT * FROM (
-         SELECT *, ROW_NUMBER() OVER (PARTITION BY file_id ORDER BY extracted_at DESC, event_id DESC) AS rn
-         FROM document_text) WHERE rn = 1""",
+    """CREATE VIEW document_text_current AS
+       WITH runs AS (
+           SELECT file_id, run_id, MIN(created_at) AS started_at FROM page_ocr GROUP BY file_id, run_id
+           UNION ALL
+           SELECT file_id, run_id, MIN(created_at) FROM pdf_conversion GROUP BY file_id, run_id),
+       latest AS (SELECT file_id, run_id FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY file_id
+                  ORDER BY started_at DESC, run_id DESC) AS rn FROM runs) WHERE rn = 1),
+       pages AS (SELECT file_id, run_id, MAX(created_at) AS extracted_at, MAX(model) AS model,
+                 COUNT(page_no) AS pages, SUM(status <> 'done') AS failed_pages, MAX(error) AS error,
+                 GROUP_CONCAT('--- Page ' || page_no || ' ---' || char(10) || COALESCE(ocr_text, ''),
+                              char(10) || char(10)) AS content
+                 FROM (SELECT * FROM page_ocr ORDER BY page_no) GROUP BY file_id, run_id),
+       conversion AS (SELECT * FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY file_id, run_id
+                      ORDER BY created_at DESC) AS rn FROM pdf_conversion) WHERE rn = 1)
+       SELECT l.file_id, l.run_id, COALESCE(p.extracted_at, c.created_at) AS extracted_at, p.model,
+              CASE WHEN c.status = 'failed' THEN 'failed'
+                   WHEN p.pages > 0 AND p.failed_pages > 0 THEN 'failed'
+                   WHEN p.pages > 0 THEN 'done' ELSE 'skipped' END AS status,
+              COALESCE(p.pages, 0) AS pages, p.content,
+              CASE WHEN c.status = 'failed' THEN c.error
+                   WHEN p.failed_pages > 0 THEN p.failed_pages || ' of ' || p.pages
+                        || ' pages failed: ' || p.error
+                   WHEN p.pages IS NULL THEN COALESCE(c.error, 'no pages') END AS error
+       FROM latest l
+       LEFT JOIN pages p ON p.file_id = l.file_id AND p.run_id = l.run_id
+       LEFT JOIN conversion c ON c.file_id = l.file_id AND c.run_id = l.run_id""",
     """CREATE VIEW document_enrichment_current AS SELECT * FROM (
          SELECT *, ROW_NUMBER() OVER (PARTITION BY file_id ORDER BY created_at DESC, event_id DESC) AS rn
          FROM document_enrichment) WHERE rn = 1""",
@@ -93,7 +116,9 @@ VIEWS_SQL = [
        UNION ALL SELECT uploaded_at, uploaded_by, 'upload', 'stored_file', document_id, file_id FROM stored_file
        UNION ALL SELECT created_at, 'system:ai', 'convert_' || status, 'pdf_conversion', NULL, file_id
        FROM pdf_conversion
-       UNION ALL SELECT extracted_at, actor, 'ocr_' || status, 'document_text', NULL, file_id FROM document_text
+       UNION ALL SELECT MIN(created_at), 'system:ai',
+              'ocr_' || CASE WHEN SUM(status <> 'done') > 0 THEN 'failed' ELSE 'done' END,
+              'page_ocr', MAX(document_id), file_id FROM page_ocr GROUP BY file_id, run_id
        UNION ALL SELECT created_at, actor, 'enrich_' || status, 'document_enrichment', document_id, file_id
        FROM document_enrichment""",
 ]
@@ -108,11 +133,15 @@ def _sql_type(dtype) -> str:
 
 def create_schema(conn: sqlite3.Connection) -> None:
     """Same constraints as sql/minidms-setup.sql: hybrid logs get
-    PRIMARY KEY (key…, version) and UNIQUE (event_id)."""
+    PRIMARY KEY (key…, version) and UNIQUE (event_id); document_enrichment gets
+    PRIMARY KEY (file_id, run_id) and UNIQUE (event_id)."""
     for table in schema.HYBRID_TABLES + schema.STANDARD_TABLES:
         cols = [f"{c} {_sql_type(t)}" for c, t in schema.COLUMNS[table].items()]
         if table in schema.LOG_KEYS:
             cols.append(f"PRIMARY KEY ({', '.join(schema.LOG_KEYS[table])}, version)")
+            cols.append("UNIQUE (event_id)")
+        if table in schema.PIPELINE_KEYS:
+            cols.append(f"PRIMARY KEY ({', '.join(schema.PIPELINE_KEYS[table])})")
             cols.append("UNIQUE (event_id)")
         conn.execute(f"CREATE TABLE {table} ({', '.join(cols)})")
     for sql in VIEWS_SQL:

@@ -52,9 +52,11 @@ Schema: [`sql/minidms-setup.sql`](sql/minidms-setup.sql)
       length inline as `[Image: …]`), `headings_list`, `image_short_summaries_list`,
       `table_summaries_list`, `page_short_summary`, plus `index_text` = all fields except
       `ocr_text`. If one page fails, the pages are retried one by one.
-   3. **Text** — the pages' `ocr_text` in order go to `document_text`.
-   4. **Enrichment** — `AI_COMPLETE` (`claude-sonnet-4-5`) writes the summary, type and
-      tag suggestions and metadata to `document_enrichment`.
+   3. **Enrichment** — `AI_COMPLETE` (`claude-sonnet-4-5`) reads the full text (the view
+      `document_text_current`: the pages' `ocr_text` in order) and writes the summary, type
+      and tag suggestions and metadata to the **hybrid table** `document_enrichment` — one
+      row per file and run (`PRIMARY KEY (file_id, run_id)`), so a rerun never writes a
+      second result.
 
    The app never calls Cortex itself.
 
@@ -63,10 +65,16 @@ Schema: [`sql/minidms-setup.sql`](sql/minidms-setup.sql)
    Procedure variables appear only in `WHERE` clauses (which request, file or page) and as
    error messages, never as values; a test enforces this. The chain is
    `ai_request` / `stored_file` → `pdf_conversion` → `pdf_page` → `page_ocr` →
-   `document_text` → `document_enrichment`, and `page_ocr.index_text` → Cortex Search.
+   `document_text_current` (view) → `document_enrichment`, and `page_ocr.index_text` →
+   Cortex Search.
    Writing the PDF files is the one step outside SQL; the tables see it through the stage
    paths, which are themselves derived columns.
-6. **Cortex Search is the sink and the search engine.** The service `document_search`
+6. **Two sinks: Cortex Search and a hybrid table.** The ingest output ends up in the
+   Cortex Search service (for search) and in the hybrid table `document_enrichment` (the
+   AI result people read and act on, looked up one document at a time). The Cortex Search
+   service can't be written to directly; its source `page_ocr` stays a standard table with
+   change tracking, as a service source must be. The full text is a view, not a table.
+   The service `document_search`
    indexes **one search document per page**: the `index_text` of the latest successful run
    per file in `page_ocr` (multilingual embedding model, target lag 1 minute). The Search
    page queries it and gets ranked pages with `document_id`/`file_id`/`page_no`; type, tag
@@ -88,7 +96,9 @@ Schema: [`sql/minidms-setup.sql`](sql/minidms-setup.sql)
 | Data | Table type | Why |
 |---|---|---|
 | Documents, metadata values, tag assignments, attachments, definitions | **hybrid**, append-only | Edited one data point at a time by people; enforced `PRIMARY KEY (id, version)` and `UNIQUE (event_id)` give conflict detection and idempotent retries |
-| `stored_file`, `ai_request`, `pdf_conversion`, `pdf_page`, `page_ocr`, `document_text`, `document_enrichment`, `ai_job_log` | standard, append-only | Facts and AI output written by `INSERT … SELECT` — lineage; large text; `page_ocr` is the change-tracked source of the Cortex Search service |
+| `document_enrichment` | **hybrid**, append-only | Sink of the pipeline; read per document and acted on by people (*Apply*); `PRIMARY KEY (file_id, run_id)` makes the pipeline idempotent |
+| `stored_file`, `ai_request`, `pdf_conversion`, `pdf_page`, `page_ocr`, `ai_job_log` | standard, append-only | Facts and pipeline steps written by `INSERT … SELECT` — lineage; large text; `page_ocr` is the change-tracked source of the Cortex Search service |
+| `document_text_current` | view | The full text, derived from `page_ocr` — not stored twice |
 
 ## Project layout
 
@@ -138,9 +148,9 @@ links to it. It walks through:
 2. **Warehouse, only if missing** — creates the adaptive `minidms_wh` if it does not exist
    (then *Use minidms_wh now* when the session has no warehouse)
 3. **Stage** — `@doc_files`
-4. **Hybrid tables** — the seven append-only logs people edit
+4. **Hybrid tables** — the seven append-only logs people edit, plus `document_enrichment`
 5. **Standard tables** — `stored_file`, `ai_request`, `pdf_conversion`, `pdf_page`,
-   `page_ocr`, `document_text`, `document_enrichment`, `ai_job_log`
+   `page_ocr`, `ai_job_log`
 6. **Views** — current state per entity, latest text / enrichment per file, AI state per
    file, per-document history, audit trail
 7. **AI pipeline** — stream `ai_request_stream`, procedure `process_ai()`, triggered task
@@ -361,6 +371,9 @@ These could not be verified without a Snowflake account. Please check them once:
 2. **Hybrid tables** are available in your account/region, with
    `PRIMARY KEY (…, version)` plus `UNIQUE (event_id)`; a duplicate raises an error that
    mentions the duplicate key (the app turns it into a conflict or "already applied").
+   `document_enrichment` (hybrid, with `ARRAY` columns) accepts `INSERT … SELECT` with
+   `AI_COMPLETE` from inside `process_ai()`. If hybrid tables turn out to be allowed as a
+   Cortex Search source, `page_ocr` could become hybrid too.
 3. **Conversion:** the Anaconda terms are accepted and `pypdf`, `pillow` and `reportlab`
    are available to Python procedures and UDFs; `SnowflakeFile.open('@doc_files/…', 'rb',
    require_scoped_url=False)` reads staged files in both, `session.file.put_stream` writes
@@ -378,8 +391,9 @@ These could not be verified without a Snowflake account. Please check them once:
    `SNOWFLAKE.CORTEX.SEARCH_PREVIEW('<db>.<schema>.document_search', '{"query": …}')`
    returns results. For production traffic, Snowflake recommends the Python/REST API of
    the service; switching `core/search.py` to it is a small change.
-6. **Column-level lineage** appears for the `page_ocr` columns, `document_text.content` and
-   the `document_enrichment` columns (Snowsight lineage or
+6. **Column-level lineage** appears for the `page_ocr` columns and the
+   `document_enrichment` columns (a hybrid table, written through the view
+   `document_text_current`) (Snowsight lineage or
    `SNOWFLAKE.ACCOUNT_USAGE.ACCESS_HISTORY`, Enterprise edition or higher). The Python
    conversion step writes files, not columns: `pdf_page.stage_path` is derived from
    `stored_file.checksum`, and `pdf_conversion.page_count` from `stored_file.stage_path`

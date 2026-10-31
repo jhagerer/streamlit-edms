@@ -43,7 +43,7 @@ GRANT SELECT, INSERT ON TABLE <db>.<schema>.ai_request          TO ROLE <app_rol
 GRANT SELECT         ON TABLE <db>.<schema>.pdf_conversion      TO ROLE <app_role>;
 GRANT SELECT         ON TABLE <db>.<schema>.pdf_page            TO ROLE <app_role>;
 GRANT SELECT         ON TABLE <db>.<schema>.page_ocr            TO ROLE <app_role>;
-GRANT SELECT         ON TABLE <db>.<schema>.document_text       TO ROLE <app_role>;
+-- Hybrid table written only by the pipeline: the app reads the AI result.
 GRANT SELECT         ON TABLE <db>.<schema>.document_enrichment TO ROLE <app_role>;
 GRANT SELECT         ON TABLE <db>.<schema>.ai_job_log          TO ROLE <app_role>;
 GRANT SELECT ON ALL VIEWS IN SCHEMA <db>.<schema> TO ROLE <app_role>;

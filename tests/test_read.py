@@ -1,6 +1,7 @@
 from datetime import datetime
 
 import polars as pl
+import pytest
 
 from conftest import stored
 from core import read, schema, search, write
@@ -86,3 +87,30 @@ def test_conform_empty_and_strings():
         "DOCUMENT_ID": ["d"], "VERSION": [1], "CREATED_AT": ["2026-01-01 10:00:00.000000"]}))
     assert df.columns == schema.columns("document_current")
     assert df["created_at"][0] == datetime(2026, 1, 1, 10)
+
+
+def test_text_view_is_derived_from_the_latest_run(fake):
+    _pages(fake, "r1", "f1", "d1", ["one", "two"], "2026-01-01 00:00:00.000000")
+    fake.conn.execute("UPDATE page_ocr SET status = 'failed', error = 'boom' "   # test setup only
+                      "WHERE run_id = 'r1' AND page_no = 2")
+    fake.conn.execute("INSERT INTO pdf_conversion (event_id, created_at, run_id, file_id, status, "
+                      "error) VALUES ('c1', '2026-01-02 00:00:00.000000', 'r2', 'f2', 'skipped', "
+                      "'no PDF conversion for this file type')")
+    texts = read.load_texts(("f1", "f2"), "t")
+    f1 = texts.filter(pl.col("file_id") == "f1").row(0, named=True)
+    assert f1["status"] == "failed" and f1["pages"] == 2
+    assert f1["content"].startswith("--- Page 1 ---\nraw text") and "1 of 2 pages failed" in f1["error"]
+    f2 = texts.filter(pl.col("file_id") == "f2").row(0, named=True)
+    assert f2["status"] == "skipped" and f2["pages"] == 0 and f2["content"] is None
+    # A newer run wins.
+    _pages(fake, "r3", "f1", "d1", ["again"], "2026-01-03 00:00:00.000000")
+    assert read.load_texts(("f1",), "t2")["pages"].to_list() == [1]
+
+
+def test_enrichment_is_one_result_per_file_and_run(fake):
+    sql = ("INSERT INTO document_enrichment (file_id, run_id, event_id, created_at, actor, "
+           "document_id, status) VALUES ('f1', 'r1', ?, '2026-01-01 00:00:00.000000', "
+           "'system:ai', 'd1', 'done')")
+    fake.conn.execute(sql, ["e1"])
+    with pytest.raises(Exception):
+        fake.conn.execute(sql, ["e2"])                       # PRIMARY KEY (file_id, run_id)

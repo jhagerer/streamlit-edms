@@ -251,7 +251,7 @@ with tab_ai:
                "summary, type and tag suggestions and metadata. The results are lineage-linked "
                "to the file. Suggestions change nothing until you apply them.")
     texts = read.load_texts(tuple(doc_files["file_id"].to_list()),
-                            _state.tokens()["document_text"])
+                            _state.tokens()["page_ocr"] + "+" + _state.tokens()["pdf_conversion"])
     enrich_all = _state.table("document_enrichment_current")
     active_type_ids = set(active_types)
     active_tag_ids = set(_ui.label_map(_ui.tags(), "tag_id"))

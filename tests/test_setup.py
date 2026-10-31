@@ -33,7 +33,7 @@ def test_setup_script_covers_every_object():
     assert all(s.kind for s in stmts), [s.sql[:40] for s in stmts if not s.kind]
     assert [st.key for st in setup.steps()] == ["warehouse", "stage", "hybrid", "standard",
                                                 "views", "pipeline", "search"]
-    assert setup.total_needed() == 1 + 1 + 7 + 8 + 12 + 1 + 4 + 3 + 1 + 1 + 1
+    assert setup.total_needed() == 1 + 1 + 8 + 6 + 12 + 1 + 4 + 3 + 1 + 1 + 1
 
 
 def _columns(sql: str) -> list[str]:
@@ -63,8 +63,11 @@ def test_every_table_is_append_only():
     the script or the app updates or deletes rows."""
     stmts = {s.name: s.sql for s in setup.setup_statements() if s.kind == "hybrid"}
     for name, sql in stmts.items():
-        keys = ", ".join(schema.LOG_KEYS[name])
-        assert f"PRIMARY KEY ({keys}, version)" in sql, name
+        if name in schema.PIPELINE_KEYS:
+            assert f"PRIMARY KEY ({', '.join(schema.PIPELINE_KEYS[name])})" in sql, name
+        else:
+            keys = ", ".join(schema.LOG_KEYS[name])
+            assert f"PRIMARY KEY ({keys}, version)" in sql, name
         assert "UNIQUE (event_id)" in sql, name
     text = setup.SETUP_SQL.read_text()
     code = "\n".join(x.sql for x in setup.setup_statements())
@@ -106,14 +109,15 @@ def test_pipeline_is_triggered_and_lineage_friendly():
     assert "CALL ocr_pages(:v_req, :v_fid, 1, 1000000)" in proc
     assert "CALL ocr_pages(:v_req, :v_fid, :v_page, :v_page)" in proc           # per-page retry
     # Lineage: AI output is written with INSERT … SELECT from its sources.
-    text = proc[proc.index("INSERT INTO document_text"):]
-    assert text.index("LISTAGG(") < text.index("FROM page_ocr o")
     enrich = proc[proc.index("INSERT INTO document_enrichment"):]
     assert "'claude-sonnet-4-5'" in enrich
     assert enrich.index("AI_COMPLETE(") < enrich.index("FROM document_text_current t")
     written = set(re.findall(r"INSERT INTO (\w+)", proc))
-    assert written == {"ai_job_log", "pdf_conversion", "pdf_page", "page_ocr", "document_text",
+    assert written == {"ai_job_log", "pdf_conversion", "pdf_page", "page_ocr",
                        "document_enrichment"}
+    # Enrichment is idempotent per run: guarded by its primary key.
+    assert ("v_n := (SELECT COUNT(*) FROM document_enrichment WHERE file_id = :v_fid "
+            "AND run_id = :v_req)") in proc
     # Page OCR: Haiku, one structured AI_COMPLETE per single-page PDF.
     ocr = by[("procedure", "ocr_pages")]
     assert set(re.findall(r"INSERT INTO (\w+)", ocr)) == {"page_ocr"}
@@ -189,6 +193,15 @@ def test_cortex_search_service_is_the_sink():
     assert "search_corpus" not in setup.SETUP_SQL.read_text()
 
 
+def test_ingest_sinks_are_cortex_search_and_a_hybrid_table():
+    by = {(s.kind, s.name): s.sql for s in setup.setup_statements()}
+    assert ("hybrid", "document_enrichment") in by
+    assert ("table", "document_text") not in by and ("hybrid", "document_text") not in by
+    view = by[("view", "document_text_current")]
+    assert "FROM page_ocr" in view and "LISTAGG(" in view       # the text is derived, not stored
+    assert "document_enrichment" not in schema.STANDARD_TABLES
+
+
 def test_no_file_bytes_in_tables_and_no_session_stage():
     """Files live in @doc_files; the tables only reference them. No @sessions:
     there is one global state, in the tables."""
@@ -213,10 +226,9 @@ def test_grants_enforce_append_only():
     by_table = {g.split(" ON ")[1].split(" TO ")[0].split(".")[-1]: g for g in grants
                 if " ON TABLE " in g}
     assert set(by_table) == set(schema.HYBRID_TABLES) | set(schema.STANDARD_TABLES)
-    for t in schema.HYBRID_TABLES + ("stored_file", "ai_request"):
+    for t in schema.LOG_TABLES + ("stored_file", "ai_request"):
         assert by_table[t].startswith("GRANT SELECT, INSERT ON"), t
-    for t in ("pdf_conversion", "pdf_page", "page_ocr", "document_text", "document_enrichment",
-              "ai_job_log"):
+    for t in ("pdf_conversion", "pdf_page", "page_ocr", "document_enrichment", "ai_job_log"):
         assert by_table[t].startswith("GRANT SELECT ON"), t     # written only by process_ai()
     assert 'GRANT USAGE ON CORTEX SEARCH SERVICE "DB"."S".document_search TO ROLE MINIDMS_APP' \
         in grants
